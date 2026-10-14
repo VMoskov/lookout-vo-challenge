@@ -28,6 +28,7 @@ from public_dataset import (asset_path, load_manifest, load_timestamps, read_jso
                             select_clips, validate_prediction, write_json)
 
 SMOOTH_SIGMA_S = 1.0
+START_WINDOW_S = 3.0  # heading 0 = mean flattened camera forward over the first 3 s
 GRID_HZ = 10.0
 MIN_POSES = 10
 
@@ -119,10 +120,14 @@ def smooth_in_time(times, values, sigma_s=SMOOTH_SIGMA_S, grid_hz=GRID_HZ):
 def integrate_planar(frame_times, heading, speed):
     """Integrate heading (rad) and speed at every frame time into an (N,3) path with z = 0.
 
+    Heading is a compass-style bearing: 0 along +y ("north" / the start direction), increasing
+    clockwise seen from above, so 90 deg is +x ("east" / right). The path is right-handed (not
+    mirrored): x = right, y = forward, z = up.
+
     Each interval uses the average of its endpoint velocity vectors (trapezoid rule).
     """
     frame_times = np.asarray(frame_times, float)
-    vel = np.asarray(speed, float)[:, None] * np.column_stack([np.cos(heading), np.sin(heading)])
+    vel = np.asarray(speed, float)[:, None] * np.column_stack([np.sin(heading), np.cos(heading)])
     dt = np.diff(frame_times)[:, None]
     steps = 0.5 * (vel[1:] + vel[:-1]) * dt
     xy = np.vstack([np.zeros((1, 2)), np.cumsum(steps, axis=0)])
@@ -130,9 +135,9 @@ def integrate_planar(frame_times, heading, speed):
 
 
 def straight_line(frame_times):
-    """Constant-velocity straight line along +x: the always-valid fallback prediction."""
+    """Constant-velocity straight line at bearing 0 (+y): the always-valid fallback prediction."""
     t = np.asarray(frame_times, float)
-    return np.column_stack([t - t[0], np.zeros(len(t)), np.zeros(len(t))])
+    return np.column_stack([np.zeros(len(t)), t - t[0], np.zeros(len(t))])
 
 
 # --------------------------------------------------------------------------------------
@@ -172,18 +177,45 @@ def estimate_up(R_wc):
     return up / norm
 
 
-def pose_heading(poses, invert=False):
-    """Per-pose unwrapped heading (rad) of the camera forward axis about the estimated up.
+def heading_frame(R_wc, times, start_window_s=START_WINDOW_S):
+    """Horizontal reference frame for headings: (up, e1, e2), or None without a usable up.
+
+    e1 (0 deg) is the mean flattened camera forward direction over the first `start_window_s`
+    seconds of poses (a window, because DPVO's first frames are noisy). e2 = e1 x up points to
+    the right of it, so headings atan2(v.e2, v.e1) are clockwise seen from above, like a compass
+    bearing: positive = turned right since the start. Falls back to an arbitrary horizontal axis if the start window has no
+    horizontal forward direction.
+    """
+    up = estimate_up(R_wc)
+    if up is None:
+        return None
+    times = np.asarray(times, float)
+    start = times <= times[0] + start_window_s
+    fwd = R_wc[start, :, 2]
+    flat = fwd - np.outer(fwd @ up, up)
+    norms = np.linalg.norm(flat, axis=1)
+    ok = norms > 0.1
+    mean = (flat[ok] / norms[ok, None]).mean(axis=0) if ok.any() else np.zeros(3)
+    if np.linalg.norm(mean) < 0.1:
+        e1, _ = plane_basis(up)
+    else:
+        e1 = mean / np.linalg.norm(mean)
+    return up, e1, np.cross(e1, up)
+
+
+def pose_heading(poses, times, invert=False):
+    """Per-pose unwrapped heading (rad) of the camera forward axis about the estimated up,
+    relative to the start direction (see heading_frame); clockwise, positive = turned right.
 
     Returns (heading, info) or (None, reason) when the geometry is unusable.
     """
     if invert:
         poses = invert_poses(poses)
     R = quat_to_rotmat(poses[:, 3:7])
-    up = estimate_up(R)
-    if up is None:
+    frame = heading_frame(R, times)
+    if frame is None:
         return None, 'camera y axes cancel out; no usable up vector'
-    e1, e2 = plane_basis(up)
+    up, e1, e2 = frame
     fwd = R[:, :, 2]
     a, b = fwd @ e1, fwd @ e2
     horiz = np.hypot(a, b)
@@ -200,17 +232,18 @@ def pose_heading(poses, invert=False):
 
 
 def motion_heading(poses, times, sigma_s=SMOOTH_SIGMA_S, invert=False):
-    """Heading of DPVO's own (smoothed) translation, projected on the plane perpendicular to up.
+    """Heading of DPVO's own (smoothed) translation, projected on the plane perpendicular to up,
+    in the same start-referenced, clockwise (compass-style) frame as pose_heading.
 
     Returns (grid_times, heading, planar_speed) with the speed in DPVO's arbitrary units.
     """
     if invert:
         poses = invert_poses(poses)
     R = quat_to_rotmat(poses[:, 3:7])
-    up = estimate_up(R)
-    if up is None:
+    frame = heading_frame(R, times)
+    if frame is None:
         return None
-    e1, e2 = plane_basis(up)
+    _, e1, e2 = frame
     planar = np.column_stack([poses[:, :3] @ e1, poses[:, :3] @ e2])
     grid, xy = smooth_in_time(times, planar, sigma_s)
     vel = np.gradient(xy, grid, axis=0)
@@ -271,7 +304,7 @@ def heading_constant_speed(poses, pose_times, frame_times, sigma_s=SMOOTH_SIGMA_
     if poses is None:
         return straight_line(frame_times), dict(method='straight_line_fallback',
                                                 reason=f'fewer than {MIN_POSES} finite poses')
-    heading, info = pose_heading(poses, invert=invert)
+    heading, info = pose_heading(poses, pose_times, invert=invert)
     if heading is None:
         return straight_line(frame_times), dict(method='straight_line_fallback', reason=info)
     h = heading_at_frames(pose_times, heading, frame_times, sigma_s)

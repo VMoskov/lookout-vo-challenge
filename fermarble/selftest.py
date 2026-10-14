@@ -26,7 +26,8 @@ from pathlib import Path
 import numpy as np
 
 import common
-from common import (STARTER_DIR, gap_aware_coverage, gaussian_smooth_uniform, heading_constant_speed,
+from common import (STARTER_DIR, gap_aware_coverage, gaussian_smooth_uniform, heading_at_frames,
+                    heading_constant_speed, integrate_planar, pose_heading,
                     invert_poses, quat_to_rotmat, rotmat_to_quat, write_json)
 
 DURATION = 299.9
@@ -226,6 +227,36 @@ def unit_checks():
     d1, d2 = np.diff(p1[:, :2], axis=0), np.diff(p2[:, :2], axis=0)
     ang = np.unwrap(np.arctan2(d1[:, 1], d1[:, 0]) - np.arctan2(d2[:, 1], d2[:, 0]))
     check(np.ptp(ang) < np.radians(0.5), f'heading is DPVO-world invariant up to a constant (spread {np.degrees(np.ptp(ang)):.3f} deg)')
+    # Heading convention: 0 = camera forward over the first 3 s, clockwise (right) positive.
+    # The mount's 7 deg yaw offset is in both the start direction and every later heading, so
+    # the camera heading must equal the boat's yaw change since the start.
+    h, _ = pose_heading(fake_dpvo_poses(boat, pt, 2), pt)
+    h = np.degrees(heading_at_frames(pt, h, pt))
+    yaw = np.degrees(np.interp(pt, boat.t, boat.yaw))
+    truth = -(yaw - yaw[pt <= pt[0] + 3.0].mean())  # boat yaw is CCW; heading is clockwise
+    err = np.abs(h - truth)
+    check(np.ptp(truth) > 30 and err.max() < 2.0,
+          f'heading = yaw turned since start, right positive (turns span {np.ptp(truth):.0f} deg, max err {err.max():.2f} deg)')
+    from oracle import true_motion
+    bearing, _ = true_motion(np.arange(4.0), np.array([[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]], float))
+    check(np.allclose(np.degrees(bearing), [0, 90, 180]), f'true heading is a compass bearing: N, E, S -> {np.degrees(bearing)}')
+    p = integrate_planar(np.arange(3.0), np.radians([90.0, 90.0, 90.0]), np.ones(3))
+    check(np.allclose(p[-1], [2, 0, 0]), 'bearing 90 deg integrates to +x (east / right)')
+    check(abs(h[pt <= pt[0] + 3.0].mean()) < 1.0, f'heading averages ~0 over the first 3 s ({h[pt <= pt[0] + 3.0].mean():.2f} deg)')
+
+
+def add_yaw_drift(poses, times, deg_per_min):
+    """Rotate camera-to-world poses about the DPVO up axis by an angle growing linearly with time,
+    so the clockwise-positive heading drifts by +deg_per_min (a DPVO yaw-drift simulation)."""
+    up = common.estimate_up(quat_to_rotmat(poses[:, 3:7]))
+    K = np.array([[0, -up[2], up[1]], [up[2], 0, -up[0]], [-up[1], up[0], 0]])
+    out = poses.copy()
+    for k, t in enumerate(times):
+        a = -np.radians(deg_per_min * (t - times[0]) / 60.0)  # CCW about up = anticlockwise heading
+        Rk = np.eye(3) + np.sin(a) * K + (1 - np.cos(a)) * K @ K
+        out[k, :3] = Rk @ poses[k, :3]
+        out[k, 3:7] = rotmat_to_quat((Rk @ quat_to_rotmat(poses[k:k + 1, 3:7])[0])[None])[0]
+    return out
 
 
 def run(cmd):
@@ -336,10 +367,27 @@ def chain(work: Path):
                '--predictions', pred_run, '--output', work / 'submission_test.json'])
     check(res.returncode != 0, 'packer refuses to overwrite')
 
+    print('heading difference (oracle.heading_difference)')
+    import oracle
+    clip0 = next(c for c in json.loads(manifest.read_text())['clips'] if c['key'] == 'clip_000')
+    hd = oracle.heading_difference(data, clip0, dpvo_run / 'poses/clip_000.npz')
+    check(hd is not None and hd[0]['label'] == 'constant' and abs(hd[0]['drift_deg_per_min']) < 1.0,
+          f"no yaw drift -> label constant ({hd[0]['label']}, {hd[0]['drift_deg_per_min']:+.2f} deg/min)")
+    z = dict(np.load(dpvo_run / 'poses/clip_000.npz'))
+    z['poses'] = add_yaw_drift(z['poses'], z['times'], 6.0)
+    (work / 'drift/poses').mkdir(parents=True)
+    np.savez(work / 'drift/poses/clip_000.npz', **z)
+    hd = oracle.heading_difference(data, clip0, work / 'drift/poses/clip_000.npz')
+    check(hd is not None and hd[0]['label'] == 'drift' and abs(hd[0]['drift_deg_per_min'] - 6.0) < 1.0,
+          f"injected +6 deg/min yaw drift recovered ({hd[0]['label']}, {hd[0]['drift_deg_per_min']:+.2f} deg/min)")
+
     print('oracle.py')
     res = run([common.FERMARBLE_DIR / 'oracle.py', '--dataset', manifest, '--split', 'train,val',
-               '--poses', dpvo_run, '--predictions', pred_run, '--output', report])
+               '--poses', dpvo_run, '--predictions', pred_run, '--output', report, '--heading-diff'])
     check(res.returncode == 0, 'oracle.py runs')
+    check((report / 'heading_diff.csv').is_file() and (report / 'heading_diff_overview.png').is_file()
+          and len(list((report / 'heading_diff').glob('*.png'))) == 2,
+          'heading-diff CSV, overview and per-clip plots written (2 clips with poses)')
     print(res.stdout.split('\n\n', 1)[-1] if res.returncode == 0 else '')
     rows = {r['key']: r for r in csv.DictReader(open(report / 'per_clip.csv'))}
     f = lambda k, v: float(rows[k][v]) if rows[k][v] not in ('', 'nan') else float('nan')

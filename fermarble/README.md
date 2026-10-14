@@ -37,6 +37,17 @@ $PY starter/evaluate.py --dataset release/release_manifest.json --split train,va
 $PY fermarble/oracle.py --split train,val --poses runs/dpvo-fps8-seed0 --predictions runs/heading --output runs/oracle
 ```
 
+## Heading convention
+
+0 deg is the direction the camera faced at the start: the mean flattened camera forward over the
+first 3 s of poses (`START_WINDOW_S`), averaged over a window because DPVO's first frames are noisy.
+Positive angles are right turns (clockwise seen from above, about the estimated up, like a compass),
+so a heading reads as "turned this much since the start". The oracle's true heading uses the same
+sense as a compass bearing (clockwise from north), so the two can be plotted side by side.
+Integrated paths are right-handed with bearing 0 along +y and 90 deg along +x. Camera heading and DPVO motion heading share
+this frame. The metric's global Sim(3) removes any constant heading offset, so the reference changes
+readability only, not scores.
+
 ## Pose convention
 
 `slam.terminate()` inverts DPVO's internal world-to-camera poses, so rows are camera-to-world

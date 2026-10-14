@@ -13,12 +13,18 @@ skipped on resume unless --retry-failed is given. Never reads references.
 """
 from __future__ import annotations
 import argparse
+import gc
 import os
 import time
 import traceback
 from pathlib import Path
 
 import numpy as np
+
+try:
+    import torch
+except ImportError:  # CPU-only self-test with a faked tracker
+    torch = None
 
 from common import (DEFAULT_DATASET, asset_path, load_manifest, load_timestamps, read_json, select_clips,
                     validate_prediction, write_json)
@@ -46,6 +52,12 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     from tracking import describe_environment, track  # imports DPVO lazily inside track()
+    if torch is not None:
+        # The starter wraps DPVO's frame loop in torch.no_grad() but calls slam.terminate() after
+        # it; terminate() runs 12 update() calls with autograd on, whose graph can exceed 14 GiB
+        # (out of memory on a 16 GB GPU). Autograd changes no forward value, so turn it off for
+        # the whole process; the starter files stay unchanged.
+        torch.set_grad_enabled(False)
 
     manifest = load_manifest(args.dataset)
     selected = select_clips(manifest, args.split, args.clips)
@@ -77,6 +89,10 @@ def main(argv=None):
             print(f'{tag}: failed before, skipping (use --retry-failed)', flush=True)
             continue
         record = dict(split=clip['split'], camera_mode=clip['camera_mode'])
+        if previous:  # keep the history of earlier (failed) attempts
+            record['previous_attempts'] = previous.pop('previous_attempts', []) + [previous]
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         started = time.perf_counter()
         print(f'{tag}: tracking ({clip["camera_mode"]})', flush=True)
         try:
@@ -118,6 +134,11 @@ def main(argv=None):
             log.write_text(traceback.format_exc())
             record.update(status='tracking_failed', reason=str(exc)[:300], error_log=str(log))
         record['elapsed_seconds'] = round(time.perf_counter() - started, 1)
+        if torch is not None and torch.cuda.is_available():
+            record['max_gpu_allocated_gib'] = round(torch.cuda.max_memory_allocated() / 2**30, 3)
+            # Release a failed clip's tensors so one out-of-memory error does not cascade.
+            gc.collect()
+            torch.cuda.empty_cache()
         run['clips'][key] = record
         write_json(manifest_path, run)
         print(f"{tag}: {record['status']} ({record['elapsed_seconds']}s)"
