@@ -27,7 +27,8 @@ import numpy as np
 
 import common
 from common import (STARTER_DIR, gap_aware_coverage, gaussian_smooth_uniform, heading_at_frames,
-                    heading_constant_speed, integrate_planar, pose_heading,
+                    heading_constant_speed, integrate_planar, pose_heading, circular_median,
+                    multi_run_heading_constant_speed,
                     invert_poses, quat_to_rotmat, rotmat_to_quat, write_json)
 
 DURATION = 299.9
@@ -205,6 +206,36 @@ def make_fake_track(truth, interrupt_on=None):
 # --------------------------------------------------------------------------------------
 # Checks
 # --------------------------------------------------------------------------------------
+def multi_run_checks():
+    print('multi-run (seed) heading combination')
+    t = np.linspace(0, 10, 200)
+    base = 0.3 * np.sin(t)
+    med = circular_median([base, base + 0.1 + 2 * np.pi, base - 0.05])
+    check(np.allclose(med, base), 'circular median ignores a full-turn unwrap offset between runs')
+    med = circular_median([base, base + 0.02, base + 2.5])
+    check(np.allclose(med, base + 0.02), 'circular median of 3 runs rejects one outlier run')
+    boat = Boat(11)
+    ft = np.arange(0, 200, 0.04)
+    pt = ft[2::3]
+    good1, good2 = fake_dpvo_poses(boat, pt, 21), fake_dpvo_poses(boat, pt, 22)
+    bad = add_yaw_drift(fake_dpvo_poses(boat, pt, 23), pt, 40.0)
+    p1, _ = heading_constant_speed(good1, pt, ft)
+    m1, info1 = multi_run_heading_constant_speed([(good1, pt)], ft)
+    check(np.array_equal(p1, m1) and info1['n_runs_used'] == 1, 'one run: identical to heading_constant_speed')
+    m3, info3 = multi_run_heading_constant_speed([(good1, pt), (bad, pt), (good2, pt)], ft)
+    truth = boat.position(ft)[:, :2]
+    err = lambda p: np.linalg.norm(np.diff(p[:, :2], axis=0), axis=1)  # step lengths are all equal
+    hd = lambda p: np.unwrap(np.arctan2(np.diff(p[:, 0]), np.diff(p[:, 1])))
+    hg = hd(p1)
+    dev3 = np.degrees(np.abs(np.angle(np.exp(1j * (hd(m3) - hg - np.median(hd(m3) - hg)))))).max()
+    pbad, _ = heading_constant_speed(bad, pt, ft)
+    devb = np.degrees(np.abs(np.angle(np.exp(1j * (hd(pbad) - hg - np.median(hd(pbad) - hg)))))).max()
+    check(info3['n_runs_used'] == 3 and dev3 < 5 < devb,
+          f'3 runs with one drifting: median heading stays with the good runs (max dev {dev3:.1f} vs {devb:.0f} deg)')
+    _, info0 = multi_run_heading_constant_speed([(None, None), (np.full((50, 7), np.nan), pt[:50])], ft)
+    check(info0['method'] == 'straight_line_fallback', 'no usable run -> straight-line fallback')
+
+
 def unit_checks():
     print('unit checks')
     rng = np.random.default_rng(0)
@@ -259,6 +290,55 @@ def add_yaw_drift(poses, times, deg_per_min):
     return out
 
 
+def thermal_checks(work: Path):
+    """CLAHE decoder: same frames/metadata as the starter worker for non-thermal clips, equalised
+    frames for thermal ones; run_dpvo --clahe installs it. Uses a small synthetic video."""
+    import queue
+    import cv2
+    import thermal
+    import tracking
+    print('thermal.py (CLAHE decoder)')
+    path = work / 'synthetic_thermal.mp4'
+    w, h, n = 320, 240, 40
+    vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*'mp4v'), 25, (w, h))
+    rng = np.random.default_rng(0)
+    for k in range(n):  # low-contrast grey scene with moving texture
+        g = (120 + 8 * np.sin(np.arange(w)[None] / 9.0 + k / 3) + rng.normal(0, 2, (h, w))).clip(0, 255)
+        vw.write(cv2.cvtColor(g.astype(np.uint8), cv2.COLOR_GRAY2BGR))
+    vw.release()
+    times = np.arange(n) / 25.0
+    cal = dict(fx=300., fy=300., cx=160., cy=120., width=w, height=h, container_width=w,
+               container_height=h, active_rect=[0, 0, w, h], provenance='estimated')
+
+    def frames(worker, preset):
+        q = queue.Queue()
+        worker(q, str(path), preset, 8.0, cal, times)
+        out = []
+        while True:
+            item = q.get_nowait()
+            if item[0] < 0:
+                assert item[0] == -1, item[1]
+                return out
+            out.append(item)
+
+    ref_wide, cl_wide = frames(tracking._stream_worker, 'wide'), frames(thermal.clahe_stream_worker, 'wide')
+    ref_ir, cl_ir = frames(tracking._stream_worker, 'flir-IR'), frames(thermal.clahe_stream_worker, 'flir-IR')
+    same_meta = all(a[0] == b[0] and a[3] == b[3] and a[4] == b[4] and np.array_equal(a[2], b[2])
+                    for a, b in zip(ref_ir, cl_ir)) and len(ref_ir) == len(cl_ir) > 0
+    check(len(ref_wide) == len(cl_wide) > 0 and all(np.array_equal(a[1], b[1]) for a, b in zip(ref_wide, cl_wide)),
+          'CLAHE decoder leaves non-thermal (wide) frames byte-identical')
+    check(same_meta, 'CLAHE decoder keeps indices, timestamps and intrinsics')
+    std = lambda fr: np.mean([f[1].std() for f in fr])
+    check(std(cl_ir) > 1.5 * std(ref_ir) and all(f[1].shape == g[1].shape and f[1].dtype == np.uint8
+                                                   for f, g in zip(cl_ir, ref_ir)),
+          f'CLAHE raises thermal frame contrast (std {std(ref_ir):.1f} -> {std(cl_ir):.1f}), same shape/dtype')
+    colour = np.dstack([np.full((60, 80), 90, np.uint8), np.full((60, 80), 110, np.uint8),
+                        (100 + 20 * np.sin(np.arange(80) / 5)).astype(np.uint8)[None].repeat(60, 0)])
+    eq = thermal.apply_clahe(colour, cv2.createCLAHE(2.0, (8, 8)))
+    check(eq.shape == colour.shape and not np.array_equal(eq[..., 0], eq[..., 2]),
+          'colour frames are equalised on lightness and stay colour')
+
+
 def run(cmd):
     res = subprocess.run([sys.executable, *map(str, cmd)], capture_output=True, text=True)
     if res.returncode != 0:
@@ -271,6 +351,7 @@ def main(argv=None):
     ap.add_argument('--keep', type=Path, help='work in this new directory and keep it')
     args = ap.parse_args(argv)
     unit_checks()
+    multi_run_checks()
     tmp = None
     if args.keep:
         work = args.keep
@@ -279,6 +360,7 @@ def main(argv=None):
         tmp = tempfile.TemporaryDirectory(prefix='fermarble-selftest-')
         work = Path(tmp.name)
     try:
+        thermal_checks(work)
         chain(work)
     finally:
         if tmp:
@@ -315,6 +397,15 @@ def chain(work: Path):
         check(calls == [], 'second resume tracks nothing (failed clip skipped)')
         run_dpvo_main(['--dataset', manifest, '--split', 'all', '--output', dpvo_run, '--retry-failed'])
         check(calls == ['clip_002'], '--retry-failed retries only the failed clip')
+        import thermal
+        real_worker = tracking._stream_worker
+        try:
+            run_dpvo_main(['--dataset', manifest, '--clips', 'clip_001', '--output', work / 'dpvo_clahe', '--clahe'])
+            rm_c = json.loads((work / 'dpvo_clahe/run_manifest.json').read_text())
+            check(tracking._stream_worker is thermal.clahe_stream_worker and 'clahe' in rm_c['settings'],
+                  'run_dpvo --clahe installs the CLAHE decoder and records it in the run settings')
+        finally:
+            tracking._stream_worker = real_worker
     finally:
         tracking.track = real_track
     rm = json.loads((dpvo_run / 'run_manifest.json').read_text())
@@ -382,8 +473,15 @@ def chain(work: Path):
           f"injected +6 deg/min yaw drift recovered ({hd[0]['label']}, {hd[0]['drift_deg_per_min']:+.2f} deg/min)")
 
     print('oracle.py')
+    res = run([common.FERMARBLE_DIR / 'make_predictions.py', '--dataset', manifest, '--split', 'all',
+               '--poses', dpvo_run, work / 'drift', dpvo_run, '--output', work / 'pred_multi'])
+    pm3 = json.loads((work / 'pred_multi/prediction_manifest.json').read_text())['clips']
+    check(res.returncode == 0 and pm3['clip_000']['n_runs_used'] == 3 and pm3['clip_001']['n_runs_used'] == 2
+          and pm3['clip_002']['method'] == 'straight_line_fallback',
+          'make_predictions with several --poses dirs combines the available runs per clip')
     res = run([common.FERMARBLE_DIR / 'oracle.py', '--dataset', manifest, '--split', 'train,val',
-               '--poses', dpvo_run, '--predictions', pred_run, '--output', report, '--heading-diff'])
+               '--poses', dpvo_run, '--predictions', pred_run, '--output', report, '--heading-diff',
+               '--worst', '3'])
     check(res.returncode == 0, 'oracle.py runs')
     check((report / 'heading_diff.csv').is_file() and (report / 'heading_diff_overview.png').is_file()
           and len(list((report / 'heading_diff').glob('*.png'))) == 2,

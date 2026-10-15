@@ -66,6 +66,66 @@ def score(est_t, est_xyz, ref_t, ref_xyz):
     return float(vo['drift_pct']) if vo is not None and np.isfinite(vo['drift_pct']) else float('nan')
 
 
+def speed_stats(ref_t, per_interval_speed, sigma_s=SMOOTH_SIGMA_S):
+    """How far the true speed is from constant: CV (std/mean) and max/median of the speed,
+    Gaussian-smoothed like the headings (sigma_s) so single-sample spikes do not dominate."""
+    mid = 0.5 * (ref_t[1:] + ref_t[:-1])
+    _, v = smooth_in_time(mid, per_interval_speed, sigma_s)
+    med = float(np.median(v))
+    return dict(mean_speed_mps=float(v.mean()),
+                speed_cv=float(v.std() / v.mean()) if v.mean() > 0 else float('nan'),
+                speed_max_median=float(v.max() / med) if med > 0 else float('nan'))
+
+
+GROSS_HEADING_DEG = 90.0  # |DPVO - true heading| beyond this while moving = tracking failure
+
+
+def classify_clip(row, hd_series=None):
+    """Which ingredient a clip's error comes from: 'dpvo_failure' (NaN poses, or the DPVO heading
+    off by >= GROSS_HEADING_DEG while moving), else 'speed' or 'heading' by which oracle swap
+    (true speed or true heading) removes more of our drift."""
+    nan_poses = row.get('n_finite_poses', 0) < row.get('n_poses', 0)
+    gross = False
+    if hd_series is not None and hd_series['moving'].any():
+        gross = bool(np.abs(hd_series['diff'][hd_series['moving']]).max() >= GROSS_HEADING_DEG)
+    speed_gain = row['dpvo_head_const'] - row['dpvo_head_true_speed']
+    heading_gain = row['dpvo_head_const'] - row['true_head_const']
+    if nan_poses or gross:
+        cat = 'dpvo_failure'
+    else:
+        cat = 'speed' if speed_gain >= heading_gain else 'heading'
+    return dict(category=cat, nan_poses=nan_poses, gross_heading_error=gross,
+                speed_gain=speed_gain, heading_gain=heading_gain)
+
+
+# Fixing a category = swapping in the truth for the ingredient that category blames.
+FIXED_VARIANT = dict(speed='dpvo_head_true_speed', heading='true_head_const', dpvo_failure='true_head_const')
+
+
+def worst_report(rows, hd_series, n_worst):
+    """Table of the n worst clips by our drift, with category, and the mean drop per category fix."""
+    for r in rows:
+        r.update(classify_clip(r, hd_series.get(r['key'])))
+    worst = sorted(rows, key=lambda r: -r['dpvo_head_const'])[:n_worst]
+    lines = [f'== {n_worst} worst clips by our drift (DPVO heading + constant speed)',
+             f"{'clip':<9}{'camera':<10}{'ours':>7}{'dH+tV':>7}{'tH+cV':>7}  {'NaN':<4}{'spd CV':>7}"
+             f"{'max/med':>8}  category"]
+    for r in worst:
+        lines.append(f"{r['key']:<9}{r['camera_mode']:<10}{r['dpvo_head_const']:>7.1f}"
+                     f"{r['dpvo_head_true_speed']:>7.1f}{r['true_head_const']:>7.1f}  "
+                     f"{'yes' if r['nan_poses'] else 'no':<4}{r['speed_cv']:>7.2f}{r['speed_max_median']:>8.2f}  "
+                     f"{r['category']}")
+    mean = np.mean([r['dpvo_head_const'] for r in rows])
+    lines.append(f'\nmean drift now {mean:.2f}% over {len(rows)} clips. Estimated mean if a category were fixed'
+                 ' (its clips get the oracle swap; categories are not additive):')
+    for scope, sel in ((f'worst {n_worst} only', worst), (f'all {len(rows)} clips', rows)):
+        for cat, variant in FIXED_VARIANT.items():
+            clips = [r for r in sel if r['category'] == cat]
+            drop = sum(r['dpvo_head_const'] - r[variant] for r in clips) / len(rows)
+            lines.append(f'  {scope:<14} {cat:<13} n={len(clips):<3} fix -> {mean - drop:6.2f}%  (drop {drop:5.2f})')
+    return '\n'.join(lines)
+
+
 def analyse_clip(root, clip, pose_path, sigma_s=SMOOTH_SIGMA_S):
     frame_t = load_timestamps(root, clip)
     ref_t, ref_xyz = load_reference(root, clip)
@@ -77,6 +137,7 @@ def analyse_clip(root, clip, pose_path, sigma_s=SMOOTH_SIGMA_S):
     row = dict(key=clip['key'], split=clip['split'], camera_mode=clip['camera_mode'],
                path_length_m=float(metrics.cumulative_length(ref_xyz)[-1]),
                ref_points=len(ref_t), n_poses=0, method='no_pose_file')
+    row.update(speed_stats(ref_t, true_v, sigma_s))
 
     def s(xyz, t=frame_t):
         return score(t, xyz, ref_t, ref_xyz)
@@ -100,6 +161,7 @@ def analyse_clip(root, clip, pose_path, sigma_s=SMOOTH_SIGMA_S):
         row[v] = nan
     if raw is not None:
         row['n_poses'] = int(len(raw['poses']))
+        row['n_finite_poses'] = int(np.isfinite(raw['poses']).all(1).sum())
         row['raw_dpvo'] = s(raw['poses'][:, :3], raw['times'])
         row['raw_overlap_cov'] = float(metrics.overlap_window(raw['times'], ref_t).mean())
         poses, pt = clean_poses(raw['poses'], raw['times'])
@@ -370,7 +432,11 @@ def main(argv=None):
     ap.add_argument('--sigma', type=float, default=SMOOTH_SIGMA_S)
     ap.add_argument('--heading-diff', action='store_true',
                     help='also analyse/plot DPVO heading minus true heading over time (needs --poses)')
+    ap.add_argument('--worst', type=int, default=0,
+                    help='also list the N worst clips, classify speed/heading/DPVO failure (needs --heading-diff)')
     args = ap.parse_args(argv)
+    if args.worst and not args.heading_diff:
+        ap.error('--worst needs --heading-diff (it uses the heading series for DPVO failures)')
     if args.heading_diff and not args.poses:
         ap.error('--heading-diff needs --poses')
     manifest = load_manifest(args.dataset)
@@ -416,6 +482,9 @@ def main(argv=None):
         write_csv(args.output / 'heading_diff.csv', hd_rows)
         plot_heading_overview(args.output / 'heading_diff_overview.png', hd_rows, hd_series)
         report += '\n\n' + heading_report(hd_rows)
+    if args.worst:
+        report += '\n\n' + worst_report(rows, hd_series, args.worst)
+        write_csv(args.output / 'per_clip.csv', rows)  # now with category columns
     (args.output / 'summary.txt').write_text(report + '\n')
     print('\n' + report)
     return 0

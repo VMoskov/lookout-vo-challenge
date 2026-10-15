@@ -49,9 +49,14 @@ def main(argv=None):
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--dpvo-buffer-size', type=int)
     ap.add_argument('--retry-failed', action='store_true', help='rerun clips recorded as failed')
+    ap.add_argument('--clahe', action='store_true',
+                    help='CLAHE-equalise thermal clips (flir-IR, infrared) before DPVO; see thermal.py')
     args = ap.parse_args(argv)
 
     from tracking import describe_environment, track  # imports DPVO lazily inside track()
+    if args.clahe:
+        import thermal
+        thermal.install()  # track() now decodes through thermal.clahe_stream_worker
     if torch is not None:
         # The starter wraps DPVO's frame loop in torch.no_grad() but calls slam.terminate() after
         # it; terminate() runs 12 update() calls with autograd on, whose graph can exceed 14 GiB
@@ -70,6 +75,9 @@ def main(argv=None):
     manifest_path = args.output / 'run_manifest.json'
     run = read_json(manifest_path) if manifest_path.is_file() else dict(clips={})
     settings = dict(target_fps=args.target_fps, seed=args.seed, dpvo_buffer_size=args.dpvo_buffer_size)
+    if args.clahe:  # key only when on, so runs started before this option still resume
+        settings['clahe'] = dict(modes=list(thermal.THERMAL_MODES), clip_limit=thermal.CLAHE_CLIP_LIMIT,
+                                 tile_grid=list(thermal.CLAHE_TILE_GRID))
     if run.get('settings', settings) != settings:
         ap.error(f'--output was started with different settings {run["settings"]}; use a new directory')
     dpvo, environment = describe_environment(args.dpvo_buffer_size)

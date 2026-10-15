@@ -293,6 +293,43 @@ def heading_at_frames(pose_times, heading, frame_times, sigma_s=SMOOTH_SIGMA_S):
     return np.interp(frame_times, grid, smooth)
 
 
+def _run_heading(poses, pose_times, frame_times, sigma_s, invert=False):
+    """One DPVO run -> (start-referenced heading at every frame, info) or (None, reason)."""
+    poses, pose_times = clean_poses(poses, pose_times) if poses is not None else (None, None)
+    if poses is None:
+        return None, f'fewer than {MIN_POSES} finite poses'
+    heading, info = pose_heading(poses, pose_times, invert=invert)
+    if heading is None:
+        return None, info
+    h = heading_at_frames(pose_times, heading, frame_times, sigma_s)
+    pose_cov = float((min(pose_times[-1], frame_times[-1]) - max(pose_times[0], frame_times[0]))
+                     / (frame_times[-1] - frame_times[0]))
+    return h, dict(n_poses=int(len(poses)), pose_time_coverage=pose_cov,
+                   mean_forward_elevation_deg=info['mean_forward_elevation_deg'],
+                   forward_motion_cos=forward_motion_cosine(poses, pose_times, sigma_s, invert))
+
+
+def circular_median(headings):
+    """Per-frame circular median of K heading series (K, N) in rad.
+
+    Offsets from the first series are wrapped to (-pi, pi] before the median, so runs that
+    differ by a full turn after unwrapping still agree; the result follows the first series'
+    unwrapping. Exact for an odd K whenever the runs span less than 180 deg at a frame.
+    """
+    H = np.asarray(headings, float)
+    offsets = np.angle(np.exp(1j * (H - H[0])))
+    return H[0] + np.median(offsets, axis=0)
+
+
+def _finish(frame_times, h, info):
+    positions = integrate_planar(frame_times, h, np.ones(len(frame_times)))
+    if not np.isfinite(positions).all():
+        return straight_line(frame_times), dict(method='straight_line_fallback',
+                                                reason='non-finite integrated path')
+    return positions, dict(method='dpvo_heading_const_speed', **info,
+                           heading_span_deg=float(np.degrees(h.max() - h.min())))
+
+
 def heading_constant_speed(poses, pose_times, frame_times, sigma_s=SMOOTH_SIGMA_S, invert=False):
     """The main model: DPVO camera heading + constant speed, at every released frame time.
 
@@ -300,25 +337,34 @@ def heading_constant_speed(poses, pose_times, frame_times, sigma_s=SMOOTH_SIGMA_
     unusable, so every clip always gets a valid prediction; info['method'] records which.
     """
     frame_times = np.asarray(frame_times, float)
-    poses, pose_times = clean_poses(poses, pose_times) if poses is not None else (None, None)
-    if poses is None:
-        return straight_line(frame_times), dict(method='straight_line_fallback',
-                                                reason=f'fewer than {MIN_POSES} finite poses')
-    heading, info = pose_heading(poses, pose_times, invert=invert)
-    if heading is None:
+    h, info = _run_heading(poses, pose_times, frame_times, sigma_s, invert)
+    if h is None:
         return straight_line(frame_times), dict(method='straight_line_fallback', reason=info)
-    h = heading_at_frames(pose_times, heading, frame_times, sigma_s)
-    positions = integrate_planar(frame_times, h, np.ones(len(frame_times)))
-    if not np.isfinite(positions).all():
-        return straight_line(frame_times), dict(method='straight_line_fallback',
-                                                reason='non-finite integrated path')
-    pose_cov = float((min(pose_times[-1], frame_times[-1]) - max(pose_times[0], frame_times[0]))
-                     / (frame_times[-1] - frame_times[0]))
-    return positions, dict(method='dpvo_heading_const_speed', n_poses=int(len(poses)),
-                           pose_time_coverage=pose_cov,
-                           mean_forward_elevation_deg=info['mean_forward_elevation_deg'],
-                           forward_motion_cos=forward_motion_cosine(poses, pose_times, sigma_s, invert),
-                           heading_span_deg=float(np.degrees(h.max() - h.min())))
+    return _finish(frame_times, h, info)
+
+
+def multi_run_heading_constant_speed(runs, frame_times, sigma_s=SMOOTH_SIGMA_S):
+    """Like heading_constant_speed, from several DPVO runs (e.g. seeds) of one clip.
+
+    `runs` is a list of (poses, pose_times); unusable runs are skipped. Each run's
+    start-referenced heading is computed separately, and the per-frame circular median is
+    integrated. With one usable run this equals heading_constant_speed exactly.
+    """
+    frame_times = np.asarray(frame_times, float)
+    heads, infos, reasons = [], [], []
+    for poses, pose_times in runs:
+        h, info = _run_heading(poses, pose_times, frame_times, sigma_s)
+        (heads if h is not None else reasons).append(h if h is not None else info)
+        if h is not None:
+            infos.append(info)
+    if not heads:
+        return straight_line(frame_times), dict(method='straight_line_fallback', n_runs=len(runs),
+                                                reason='; '.join(map(str, reasons)) or 'no runs')
+    h = circular_median(heads) if len(heads) > 1 else heads[0]
+    spread = [float(np.degrees(np.median(np.abs(np.angle(np.exp(1j * (x - h))))))) for x in heads]
+    info = dict(infos[0], n_runs=len(runs), n_runs_used=len(heads),
+                run_median_abs_dev_deg=spread)
+    return _finish(frame_times, h, info)
 
 
 # --------------------------------------------------------------------------------------
