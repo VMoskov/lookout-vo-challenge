@@ -25,7 +25,9 @@ from pathlib import Path
 
 import numpy as np
 
-from common import (DEFAULT_DATASET, SMOOTH_SIGMA_S, START_WINDOW_S, clean_poses, gap_aware_coverage,
+from common import (DEFAULT_DATASET, NO_LIMIT, REPO_ROOT, SMOOTH_SIGMA_S, START_WINDOW_S, clean_poses,
+                    filter_flow_speed, flow_reliable_speed, flow_speed_from_reliable, multi_run_heading,
+                    read_json, rolling_median, gap_aware_coverage,
                     forward_motion_cosine, heading_at_frames, heading_constant_speed, integrate_planar, load_manifest,
                     load_pose_npz, load_timestamps, motion_heading, pose_heading, select_clips,
                     smooth_in_time, straight_line, write_json)
@@ -388,6 +390,183 @@ def write_csv(path, rows):
             w.writerow({k: (f'{v:.4f}' if isinstance(v, float) else v) for k, v in r.items()})
 
 
+def true_speed_series(ref_t, ref_xyz, sigma_s=SMOOTH_SIGMA_S):
+    """True speed (m/s) at reference-interval midpoints, smoothed like the headings."""
+    _, tv = true_motion(ref_t, ref_xyz)
+    mid = 0.5 * (ref_t[1:] + ref_t[:-1])
+    g, v = smooth_in_time(mid, tv, sigma_s)
+    return g, v
+
+
+def flow_diag(root, clip, speed_npz, out_png, med3_dirs=()):
+    """Compare raw flow speeds (all / near / far bands) with the true speed for one clip, and
+    score true heading + flow speed with a minimal filter (NaN -> clip median, 2 s rolling median)."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from common import flow_speed_profile
+    d = np.load(speed_npz)
+    ref_t, ref_xyz = load_reference(root, clip)
+    frame_t = load_timestamps(root, clip)
+    gt, gv = true_speed_series(ref_t, ref_xyz)
+    th, tv = true_motion(ref_t, ref_xyz)
+    thf = at_frames_piecewise(ref_t, th, frame_t)
+    row = dict(key=clip['key'], camera_mode=clip['camera_mode'])
+    fig, ax = plt.subplots(2, 1, figsize=(11, 6.5), sharex=True)
+    ax[0].plot(gt, gv / np.median(gv), 'k', lw=2, label='true speed / median')
+    for band, col in (('all', 'tab:blue'), ('near', 'tab:orange'), ('far', 'tab:green')):
+        v = d[f'speed_{band}']
+        ok = np.isfinite(v)
+        tr = np.interp(d['t_mid'][ok], gt, gv)
+        row[f'corr_{band}'] = float(np.corrcoef(v[ok], tr)[0, 1]) if ok.sum() > 10 else np.nan
+        row[f'valid_{band}'] = float(ok.mean())
+        ax[0].plot(d['t_mid'], v / np.nanmedian(v), color=col, lw=0.5, alpha=0.6,
+                   label=f"flow {band} / median (r={row[f'corr_{band}']:.2f})")
+    prof = flow_speed_profile(d, frame_t, band='all', window_s=2.0)
+    row['drift_true_head_flow_speed'] = score(frame_t, integrate_planar(frame_t, thf, prof), ref_t, ref_xyz)
+    row['drift_true_head_const'] = score(frame_t, integrate_planar(frame_t, thf, np.ones(len(frame_t))), ref_t, ref_xyz)
+    row['drift_true_head_true_speed'] = score(frame_t, integrate_planar(frame_t, thf, at_frames_piecewise(ref_t, tv, frame_t)), ref_t, ref_xyz)
+    ax[0].plot(frame_t, prof / np.median(prof), 'r', lw=1.2, label='flow profile (2 s median) / median')
+    ax[0].set_ylim(0, 4)
+    ax[0].set_ylabel('speed / clip median')
+    ax[0].legend(fontsize=7, loc='upper left')
+    rat = d['speed_near'] / d['speed_far']
+    ax[1].plot(d['t_mid'], rat / np.nanmedian(rat), lw=0.5)
+    ax[1].set_ylim(0, 3)
+    ax[1].set_ylabel('near/far (norm.)')
+    ax[1].set_xlabel('time (s)')
+    ax[0].set_title(f"{clip['key']} ({clip['camera_mode']}): true head + flow speed "
+                    f"{row['drift_true_head_flow_speed']:.1f}% vs const {row['drift_true_head_const']:.1f}% "
+                    f"vs true speed {row['drift_true_head_true_speed']:.1f}%", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=100)
+    plt.close(fig)
+    return row
+
+
+# --------------------------------------------------------------------------------------
+# Flow speed: tuning (train only) and evaluation
+# --------------------------------------------------------------------------------------
+TUNE_GRID = dict(agree_tol=[0.15, 0.25, 0.4, 0.6, 1.0, NO_LIMIT], window_s=[1.0, 2.0, 4.0, 8.0],
+                 clamp_lo=[0.0, 0.1, 0.25], clamp_hi=[3.0, 6.0, NO_LIMIT], min_reliable_frac=[0.0, 0.25, 0.5])
+
+
+def speed_clip_data(root, clip, speed_npz, heading_pose_paths, sigma_s=SMOOTH_SIGMA_S):
+    """Everything needed to score speed variants on one clip (references included)."""
+    frame_t = load_timestamps(root, clip)
+    ref_t, ref_xyz = load_reference(root, clip)
+    th, tv = true_motion(ref_t, ref_xyz)
+    runs = []
+    for pp in heading_pose_paths:
+        if pp.is_file():
+            z = load_pose_npz(pp)
+            runs.append((z['poses'], z['times']))
+    med3, _ = multi_run_heading(runs, frame_t, sigma_s)
+    d = dict(np.load(speed_npz)) if speed_npz is not None and speed_npz.is_file() else None
+    return dict(key=clip['key'], split=clip['split'], camera_mode=clip['camera_mode'], frame_t=frame_t,
+                ref_t=ref_t, ref_xyz=ref_xyz, thf=at_frames_piecewise(ref_t, th, frame_t),
+                tvf=at_frames_piecewise(ref_t, tv, frame_t), med3=med3, d=d)
+
+
+def _score_speed(data, heading, speed):
+    if heading is None:
+        return score(data['frame_t'], straight_line(data['frame_t']), data['ref_t'], data['ref_xyz'])
+    return score(data['frame_t'], integrate_planar(data['frame_t'], heading, speed), data['ref_t'], data['ref_xyz'])
+
+
+def _tune_clip(args):
+    """All TUNE_GRID combinations on one clip -> array [n_combos, 2] (true heading, med3 heading)."""
+    root, clip, speed_npz, pose_paths = args
+    data = speed_clip_data(root, clip, speed_npz, pose_paths)
+    g = TUNE_GRID
+    out = []
+    for tol in g['agree_tol']:
+        t, v, rel, n_rel = flow_reliable_speed(data['d'], tol)
+        for win in g['window_s']:
+            sm = rolling_median(t, v, win) if n_rel >= 10 else None
+            for lo in g['clamp_lo']:
+                for hi in g['clamp_hi']:
+                    for mf in g['min_reliable_frac']:
+                        if rel < mf or n_rel < 10:
+                            sp = np.ones(len(data['frame_t']))
+                        else:
+                            sp, _ = flow_speed_from_reliable(t, v, data['frame_t'], win, lo, hi, smoothed=sm)
+                        out.append((_score_speed(data, data['thf'], sp), _score_speed(data, data['med3'], sp)))
+    return clip['key'], np.array(out)
+
+
+def tune_speed(root, clips, speed_dir, pose_dirs, workers=8):
+    """Fit filter_flow_speed thresholds on the given (TRAIN) clips: minimise mean drift of
+    med3 heading + flow speed. Returns (best params, table rows)."""
+    from concurrent.futures import ProcessPoolExecutor
+    import itertools
+    combos = list(itertools.product(*TUNE_GRID.values()))
+    jobs = [(root, c, speed_dir / 'speed' / f"{c['key']}.npz", [d / 'poses' / f"{c['key']}.npz" for d in pose_dirs])
+            for c in clips if (speed_dir / 'speed' / f"{c['key']}.npz").is_file()]
+    with ProcessPoolExecutor(workers) as ex:
+        res = dict(ex.map(_tune_clip, jobs))
+    A = np.stack([res[k] for k in sorted(res)])          # clips x combos x 2
+    mean = np.nanmean(A, axis=0)
+    order = np.argsort(mean[:, 1])
+    rows = [dict(zip(TUNE_GRID, combos[i]), mean_true_head_flow=float(mean[i, 0]),
+                 mean_med3_flow=float(mean[i, 1])) for i in order]
+    return dict(zip(TUNE_GRID, combos[order[0]])), rows, len(res)
+
+
+def speed_eval_clip(args):
+    root, clip, speed_npz, pose_paths, params = args
+    data = speed_clip_data(root, clip, speed_npz, pose_paths)
+    n = len(data['frame_t'])
+    ones = np.ones(n)
+    row = dict(key=clip['key'], split=clip['split'], camera_mode=clip['camera_mode'],
+               true_head_const=_score_speed(data, data['thf'], ones),
+               med3_const=_score_speed(data, data['med3'], ones),
+               true_head_true_speed=_score_speed(data, data['thf'], data['tvf']),
+               med3_true_speed=_score_speed(data, data['med3'], data['tvf']))
+    if data['d'] is not None:
+        sp, info = filter_flow_speed(data['d'], data['frame_t'], params)
+        row.update(true_head_flow=_score_speed(data, data['thf'], sp),
+                   med3_flow=_score_speed(data, data['med3'], sp), uses_flow=True, **info)
+    else:  # no flow speed for this camera mode: constant speed
+        row.update(true_head_flow=row['true_head_const'], med3_flow=row['med3_const'], uses_flow=False,
+                   speed_fallback='not run', reliable_frac=np.nan, fallback_frac=np.nan)
+    return row
+
+
+SPEED_VARIANTS = ['true_head_const', 'true_head_flow', 'true_head_true_speed',
+                  'med3_const', 'med3_flow', 'med3_true_speed']
+
+
+def speed_report(rows, worst_keys):
+    def block(title, groups):
+        lines = [f'== {title} (mean drift %)',
+                 f"{'group':<18}{'n':>4}" + ''.join(f'{v:>15}' for v in SPEED_VARIANTS) + f"{'clip fallb.':>13}{'frame fallb.':>14}"]
+        for name, g in groups:
+            if not g:
+                continue
+            fl = [r for r in g if r['uses_flow']]
+            clipfb = sum(r['speed_fallback'] == 'clip' for r in fl)
+            fr = np.nanmean([1.0 if r['speed_fallback'] == 'clip' else r['fallback_frac'] for r in fl]) if fl else np.nan
+            lines.append(f'{name:<18}{len(g):>4}' + ''.join(f"{np.nanmean([r[v] for r in g]):>15.2f}" for v in SPEED_VARIANTS)
+                         + f'{clipfb:>8}/{len(fl):<4}' + (f'{fr:>14.3f}' if fl else f"{'-':>14}"))
+        return '\n'.join(lines)
+    modes = sorted({r['camera_mode'] for r in rows}, key=lambda m: -sum(r['camera_mode'] == m for r in rows))
+    out = []
+    for split in ('train', 'val'):
+        g = [r for r in rows if r['split'] == split]
+        out.append(block(f'{split}', [('all', g), ('all except zoom', [r for r in g if r['camera_mode'] != 'zoom'])]
+                         + [(m, [r for r in g if r['camera_mode'] == m]) for m in modes]))
+    out.append(block('train+val', [('all', rows), ('all except zoom', [r for r in rows if r['camera_mode'] != 'zoom'])]))
+    w = [r for r in rows if r['key'] in worst_keys]
+    out.append(block('15 worst clips of the earlier table', [('worst 15', w)]))
+    lines = [f"{'clip':<10}{'split':<6}{'mode':<9}" + ''.join(f'{v:>15}' for v in SPEED_VARIANTS) + '  fallback']
+    for r in sorted(w, key=lambda r: -r['med3_const']):
+        lines.append(f"{r['key']:<10}{r['split']:<6}{r['camera_mode']:<9}" + ''.join(f'{r[v]:>15.1f}' for v in SPEED_VARIANTS)
+                     + f"  {r['speed_fallback']} ({r['fallback_frac'] if r['uses_flow'] else float('nan'):.2f})")
+    out.append('\n'.join(lines))
+    return '\n\n'.join(out)
+
+
 def group_means(rows, key_fn):
     out = {}
     for row in rows:
@@ -432,6 +611,12 @@ def main(argv=None):
     ap.add_argument('--sigma', type=float, default=SMOOTH_SIGMA_S)
     ap.add_argument('--heading-diff', action='store_true',
                     help='also analyse/plot DPVO heading minus true heading over time (needs --poses)')
+    ap.add_argument('--flow-diag', type=Path, help='flow_speed.py output dir: plot/score flow speed vs truth')
+    ap.add_argument('--speed-tune', type=Path, help='flow_speed.py output dir: fit the speed filter on TRAIN clips')
+    ap.add_argument('--speed-eval', type=Path, help='flow_speed.py output dir: evaluate speed variants (with --speed-params)')
+    ap.add_argument('--speed-params', type=Path, help='speed filter thresholds JSON (from --speed-tune)')
+    ap.add_argument('--heading-poses', type=Path, nargs='+', help='run_dpvo.py dirs for the median heading (e.g. 3 seeds)')
+    ap.add_argument('--workers', type=int, default=8)
     ap.add_argument('--worst', type=int, default=0,
                     help='also list the N worst clips, classify speed/heading/DPVO failure (needs --heading-diff)')
     args = ap.parse_args(argv)
@@ -444,6 +629,48 @@ def main(argv=None):
     if any(c['reference'] is None for c in selected):
         ap.error('oracle needs references; test clips have none')
     root = args.dataset.resolve().parent
+    if args.speed_tune:
+        train = [c for c in selected if c['split'] == 'train']
+        if len(train) != len(selected):
+            ap.error('--speed-tune fits on TRAIN clips only; select --split train')
+        best, table, n = tune_speed(root, train, args.speed_tune, args.heading_poses, args.workers)
+        args.output.mkdir(parents=True, exist_ok=True)
+        write_json(args.output / 'speed_params.json', best)
+        write_csv(args.output / 'speed_tune.csv', table)
+        print(f'tuned on {n} train clips; best (mean med3+flow {table[0]["mean_med3_flow"]:.2f}%, '
+              f'true head+flow {table[0]["mean_true_head_flow"]:.2f}%): {best}')
+        for r in table[:8]:
+            print({k: (round(v, 3) if isinstance(v, float) else v) for k, v in r.items()})
+        return 0
+    if args.speed_eval:
+        from concurrent.futures import ProcessPoolExecutor
+        params = read_json(args.speed_params) if args.speed_params else None
+        jobs = [(root, c, args.speed_eval / 'speed' / f"{c['key']}.npz",
+                 [d / 'poses' / f"{c['key']}.npz" for d in args.heading_poses], params) for c in selected]
+        with ProcessPoolExecutor(args.workers) as ex:
+            rows = list(ex.map(speed_eval_clip, jobs))
+        args.output.mkdir(parents=True, exist_ok=True)
+        write_csv(args.output / 'speed_eval.csv', rows)
+        worst = set()
+        prev = REPO_ROOT / 'runs' / 'oracle' / 'per_clip.csv'  # the earlier seed-0 oracle table
+        if prev.is_file():
+            old = list(csv.DictReader(open(prev)))
+            worst = {r['key'] for r in sorted(old, key=lambda r: -float(r['dpvo_head_const']))[:15]}
+        report = speed_report(rows, worst)
+        (args.output / 'speed_eval.txt').write_text(report + '\n')
+        print(report)
+        return 0
+    if args.flow_diag:
+        args.output.mkdir(parents=True, exist_ok=True)
+        diag = []
+        for clip in selected:
+            sp = args.flow_diag / 'speed' / f"{clip['key']}.npz"
+            if sp.is_file():
+                r = flow_diag(root, clip, sp, args.output / f"flow_{clip['key']}.png")
+                diag.append(r)
+                print({k: (round(v, 3) if isinstance(v, float) else v) for k, v in r.items()}, flush=True)
+        write_csv(args.output / 'flow_diag.csv', diag)
+        return 0
     rows, hd_rows, hd_series = [], [], {}
     hd_dir = args.output / 'heading_diff'
     if args.heading_diff:

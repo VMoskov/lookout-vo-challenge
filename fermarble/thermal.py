@@ -13,7 +13,9 @@ import sys
 import cv2
 import numpy as np
 
-THERMAL_MODES = ('flir-IR', 'infrared')
+# flir-IR only: on train+val CLAHE helped flir-IR (3-seed median 10.8 -> 8.0 %) but hurt the
+# 'infrared' clip (42.9 -> 52.4 %), which is a colour low-light camera, not thermal.
+THERMAL_MODES = ('flir-IR',)
 CLAHE_CLIP_LIMIT = 2.0
 CLAHE_TILE_GRID = (8, 8)
 

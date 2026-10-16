@@ -50,7 +50,7 @@ def main(argv=None):
     ap.add_argument('--dpvo-buffer-size', type=int)
     ap.add_argument('--retry-failed', action='store_true', help='rerun clips recorded as failed')
     ap.add_argument('--clahe', action='store_true',
-                    help='CLAHE-equalise thermal clips (flir-IR, infrared) before DPVO; see thermal.py')
+                    help='CLAHE-equalise thermal (flir-IR) clips before DPVO; see thermal.py')
     args = ap.parse_args(argv)
 
     from tracking import describe_environment, track  # imports DPVO lazily inside track()

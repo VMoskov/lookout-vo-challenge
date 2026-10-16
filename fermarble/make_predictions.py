@@ -11,21 +11,25 @@ prediction. Never reads references.
 """
 from __future__ import annotations
 import argparse
+import json
 from collections import Counter
 from pathlib import Path
 
 import numpy as np
 
 from common import (DEFAULT_DATASET, SMOOTH_SIGMA_S, heading_constant_speed, load_manifest,
-                    load_pose_npz, load_timestamps, multi_run_heading_constant_speed,
+                    filter_flow_speed, load_pose_npz, load_timestamps, multi_run_heading_constant_speed,
                     prediction_dict, select_clips, validate_prediction, write_json)
 
 
-def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False):
+def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, speed_path=None,
+                 speed_params=None):
     """Returns (prediction dict, info dict) for one clip.
 
     `pose_paths` lists one npz per DPVO run (e.g. per seed); several runs are combined by the
     per-frame circular median of their headings. Missing or mismatched files are skipped.
+    With `speed_path` (a flow_speed.py npz) the constant speed is replaced by the filtered flow
+    speed (filter_flow_speed with `speed_params`); otherwise the speed is constant.
     """
     frame_times = load_timestamps(root, clip)
     runs, errors = [], []
@@ -44,7 +48,18 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False):
         poses, times = runs[0] if runs else (None, None)
         positions, info = heading_constant_speed(poses, times, frame_times, sigma_s, invert=True)
     else:
-        positions, info = multi_run_heading_constant_speed(runs, frame_times, sigma_s)
+        speed, speed_info = None, {}
+        if speed_path is not None and speed_path.is_file():
+            d = np.load(speed_path)
+            if not np.allclose(d['times'], frame_times[d['frame_indices']], rtol=0, atol=1e-6):
+                raise ValueError(f'{speed_path}: speed file frames do not match released timestamps')
+            speed, speed_info = filter_flow_speed(d, frame_times, speed_params)
+            if speed_info['speed_fallback'] == 'clip':
+                speed = None  # constant speed, exactly as without --speed
+        elif speed_path is not None:
+            speed_info = dict(speed_fallback='no speed file')
+        positions, info = multi_run_heading_constant_speed(runs, frame_times, sigma_s, speed=speed)
+        info.update(speed_info)
     if errors:
         info['pose_errors'] = errors
     if not runs:
@@ -66,6 +81,9 @@ def main(argv=None):
     ap.add_argument('--sigma', type=float, default=SMOOTH_SIGMA_S, help='heading smoothing sigma, s')
     ap.add_argument('--invert-poses', action='store_true', help='convention check: treat poses as world-to-camera')
     ap.add_argument('--overwrite', action='store_true', help='allow a non-empty --output')
+    ap.add_argument('--speed', type=Path, help='flow_speed.py output dir: use flow speed instead of constant')
+    ap.add_argument('--speed-params', type=Path, help='JSON of filter_flow_speed thresholds (fitted on train)')
+    ap.add_argument('--speed-modes', default='wide', help='camera modes that use flow speed (others constant)')
     args = ap.parse_args(argv)
     if args.invert_poses and len(args.poses or []) > 1:
         ap.error('--invert-poses takes a single --poses directory')
@@ -74,11 +92,14 @@ def main(argv=None):
     manifest = load_manifest(args.dataset)
     selected = select_clips(manifest, args.split, args.clips)
     root = args.dataset.resolve().parent
+    speed_params = json.loads(args.speed_params.read_text()) if args.speed_params else None
     records = {}
     for clip in selected:
         key = clip['key']
         pose_paths = [d / 'poses' / f'{key}.npz' for d in args.poses or []]
-        pred, info = predict_clip(root, clip, pose_paths, args.sigma, args.invert_poses)
+        use_speed = args.speed is not None and clip['camera_mode'] in args.speed_modes.split(',')
+        pred, info = predict_clip(root, clip, pose_paths, args.sigma, args.invert_poses,
+                                  args.speed / 'speed' / f'{key}.npz' if use_speed else None, speed_params)
         write_json(args.output / 'predictions' / f'{key}.json', pred)
         # JSON cannot hold NaN: a diagnostic that is undefined for a clip is recorded as null
         info = {k: (None if isinstance(v, float) and not np.isfinite(v) else v) for k, v in info.items()}
@@ -87,6 +108,8 @@ def main(argv=None):
         print(f"{key}: {info['method']}" + (f" ({info['reason']})" if 'reason' in info else ''), flush=True)
     write_json(args.output / 'prediction_manifest.json',
                dict(poses=[str(d) for d in args.poses or []], sigma_s=args.sigma,
+                    speed=str(args.speed) if args.speed else None, speed_params=speed_params,
+                    speed_modes=args.speed_modes if args.speed else None,
                     invert_poses=args.invert_poses, clips=records))
     counts = Counter(r['method'] for r in records.values())
     print(f'PREDICTIONS_COMPLETE: {len(records)} clips, {dict(counts)}')

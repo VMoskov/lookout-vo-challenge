@@ -343,28 +343,123 @@ def heading_constant_speed(poses, pose_times, frame_times, sigma_s=SMOOTH_SIGMA_
     return _finish(frame_times, h, info)
 
 
-def multi_run_heading_constant_speed(runs, frame_times, sigma_s=SMOOTH_SIGMA_S):
-    """Like heading_constant_speed, from several DPVO runs (e.g. seeds) of one clip.
-
-    `runs` is a list of (poses, pose_times); unusable runs are skipped. Each run's
-    start-referenced heading is computed separately, and the per-frame circular median is
-    integrated. With one usable run this equals heading_constant_speed exactly.
-    """
+def multi_run_heading(runs, frame_times, sigma_s=SMOOTH_SIGMA_S):
+    """Circular-median heading at every frame from several DPVO runs.
+    Returns (heading or None, info) where info has n_runs, n_runs_used, run deviations."""
     frame_times = np.asarray(frame_times, float)
     heads, infos, reasons = [], [], []
     for poses, pose_times in runs:
         h, info = _run_heading(poses, pose_times, frame_times, sigma_s)
-        (heads if h is not None else reasons).append(h if h is not None else info)
-        if h is not None:
+        if h is None:
+            reasons.append(info)
+        else:
+            heads.append(h)
             infos.append(info)
     if not heads:
-        return straight_line(frame_times), dict(method='straight_line_fallback', n_runs=len(runs),
-                                                reason='; '.join(map(str, reasons)) or 'no runs')
+        return None, dict(n_runs=len(runs), reason='; '.join(map(str, reasons)) or 'no runs')
     h = circular_median(heads) if len(heads) > 1 else heads[0]
     spread = [float(np.degrees(np.median(np.abs(np.angle(np.exp(1j * (x - h))))))) for x in heads]
-    info = dict(infos[0], n_runs=len(runs), n_runs_used=len(heads),
-                run_median_abs_dev_deg=spread)
-    return _finish(frame_times, h, info)
+    return h, dict(infos[0], n_runs=len(runs), n_runs_used=len(heads), run_median_abs_dev_deg=spread)
+
+
+def multi_run_heading_constant_speed(runs, frame_times, sigma_s=SMOOTH_SIGMA_S, speed=None):
+    """Like heading_constant_speed, from several DPVO runs (e.g. seeds) of one clip.
+
+    `runs` is a list of (poses, pose_times); unusable runs are skipped. Each run's
+    start-referenced heading is computed separately, and the per-frame circular median is
+    integrated. With one usable run this equals heading_constant_speed exactly. `speed`
+    (relative speed at every frame, e.g. from filter_flow_speed) replaces the constant speed.
+    """
+    frame_times = np.asarray(frame_times, float)
+    h, info = multi_run_heading(runs, frame_times, sigma_s)
+    if h is None:
+        return straight_line(frame_times), dict(method='straight_line_fallback', **info)
+    if speed is None:
+        return _finish(frame_times, h, info)
+    positions = integrate_planar(frame_times, h, speed)
+    if not np.isfinite(positions).all():
+        return _finish(frame_times, h, dict(info, speed_reason='non-finite path with flow speed'))
+    return positions, dict(method='dpvo_heading_flow_speed', **info,
+                           heading_span_deg=float(np.degrees(h.max() - h.min())))
+
+
+def rolling_median(times, values, window_s):
+    """Centred rolling median over +-window_s/2 seconds (NaNs ignored; NaN where none)."""
+    times = np.asarray(times, float)
+    values = np.asarray(values, float)
+    out = np.full(len(values), np.nan)
+    lo = np.searchsorted(times, times - window_s / 2)
+    hi = np.searchsorted(times, times + window_s / 2, side='right')
+    for i in range(len(values)):
+        w = values[lo[i]:hi[i]]
+        w = w[np.isfinite(w)]
+        if len(w):
+            out[i] = np.median(w)
+    return out
+
+
+def flow_speed_profile(d, frame_times, band='all', window_s=2.0):
+    """Minimal flow-speed profile at every frame time (diagnostics): rolling median of one band,
+    NaN -> the clip median. Relative units (Sim(3) absorbs the scale)."""
+    v = np.asarray(d[f'speed_{band}'], float)
+    med = np.nanmedian(v) if np.isfinite(v).any() else 1.0
+    sm = rolling_median(d['t_mid'], v, window_s)
+    sm = np.where(np.isfinite(sm), sm, med)
+    return np.interp(frame_times, d['t_mid'], sm)
+
+
+# Thresholds of filter_flow_speed. Defaults are placeholders; oracle.py --speed-tune fits them on
+# TRAIN clips only and writes them to a JSON file that make_predictions.py --speed-params reads.
+# (NO_LIMIT instead of inf so the parameters stay valid JSON.)
+NO_LIMIT = 1e6
+FLOW_FILTER_DEFAULTS = dict(agree_tol=0.5, window_s=2.0, clamp_lo=0.0, clamp_hi=NO_LIMIT,
+                            min_reliable_frac=0.3)
+
+
+def flow_reliable_speed(d, agree_tol):
+    """Stage 1 of filter_flow_speed: normalised near/far bands, agreement test, geometric mean.
+    Returns (t_mid, speed or NaN where unreliable, reliable fraction, n usable pairs)."""
+    near = np.asarray(d['speed_near'], float)
+    far = np.asarray(d['speed_far'], float)
+    t = np.asarray(d['t_mid'], float)
+    ok = np.isfinite(near) & np.isfinite(far) & (near > 0) & (far > 0)
+    if ok.sum() < 10:
+        return t, np.full(len(t), np.nan), float(ok.mean()), int(ok.sum())
+    nn = near / np.median(near[ok])
+    ff = far / np.median(far[ok])
+    with np.errstate(divide='ignore', invalid='ignore'):
+        agree = ok & (np.abs(np.log(nn / ff)) <= agree_tol)
+    return t, np.where(agree, np.sqrt(nn * ff), np.nan), float(agree.mean()), int(agree.sum())
+
+
+def flow_speed_from_reliable(t, v, frame_times, window_s, clamp_lo, clamp_hi, smoothed=None):
+    """Stage 2: rolling median, fill gaps with the clip median, clamp, sample at frame times.
+    `smoothed` may pass a precomputed rolling_median(t, v, window_s). Returns (speed, filled frac)."""
+    sm = rolling_median(t, v, window_s) if smoothed is None else smoothed
+    med = float(np.nanmedian(v))
+    filled = ~np.isfinite(sm)
+    sm = np.clip(np.where(filled, med, sm), clamp_lo * med, clamp_hi * med)
+    return np.interp(frame_times, t, sm / med), float(filled.mean())
+
+
+def filter_flow_speed(d, frame_times, params=None):
+    """Relative speed at every frame from flow_speed.py's per-pair measurements.
+
+    1. Each band (near, far) is normalised by its clip median; a pair is reliable when both
+       bands exist and |log(near/far)| <= agree_tol. Its speed is their geometric mean.
+    2. Rolling median over window_s seconds of the reliable pairs.
+    3. Clamp to [clamp_lo, clamp_hi] x the clip median of the reliable speeds.
+    4. Pairs with no reliable value in their window get the clip median. If fewer than
+       min_reliable_frac of the pairs are reliable, the whole clip falls back to constant speed.
+    Returns (speed at frame_times, info). Units are relative (clip median = 1).
+    """
+    p = dict(FLOW_FILTER_DEFAULTS, **(params or {}))
+    frame_times = np.asarray(frame_times, float)
+    t, v, rel_frac, n_rel = flow_reliable_speed(d, p['agree_tol'])
+    if rel_frac < p['min_reliable_frac'] or n_rel < 10:
+        return np.ones(len(frame_times)), dict(speed_fallback='clip', reliable_frac=rel_frac, fallback_frac=1.0)
+    speed, filled = flow_speed_from_reliable(t, v, frame_times, p['window_s'], p['clamp_lo'], p['clamp_hi'])
+    return speed, dict(speed_fallback='none', reliable_frac=rel_frac, fallback_frac=filled)
 
 
 # --------------------------------------------------------------------------------------
