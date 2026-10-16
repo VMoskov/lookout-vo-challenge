@@ -49,6 +49,8 @@ def main(argv=None):
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--dpvo-buffer-size', type=int)
     ap.add_argument('--retry-failed', action='store_true', help='rerun clips recorded as failed')
+    ap.add_argument('--focal-scale', type=float, default=1.0,
+                    help='experiment: multiply the released fx, fy by this (e.g. a zoomed camera)')
     ap.add_argument('--clahe', action='store_true',
                     help='CLAHE-equalise thermal (flir-IR) clips before DPVO; see thermal.py')
     args = ap.parse_args(argv)
@@ -75,6 +77,8 @@ def main(argv=None):
     manifest_path = args.output / 'run_manifest.json'
     run = read_json(manifest_path) if manifest_path.is_file() else dict(clips={})
     settings = dict(target_fps=args.target_fps, seed=args.seed, dpvo_buffer_size=args.dpvo_buffer_size)
+    if args.focal_scale != 1.0:  # key only when used, so older runs still resume
+        settings['focal_scale'] = args.focal_scale
     if args.clahe:  # key only when on, so runs started before this option still resume
         settings['clahe'] = dict(modes=list(thermal.THERMAL_MODES), clip_limit=thermal.CLAHE_CLIP_LIMIT,
                                  tile_grid=list(thermal.CLAHE_TILE_GRID))
@@ -106,8 +110,11 @@ def main(argv=None):
         try:
             frame_times = load_timestamps(root, clip)
             video = asset_path(root, clip['video'])
+            calibration = dict(clip['calibration'])
+            if args.focal_scale != 1.0:
+                calibration.update(fx=calibration['fx'] * args.focal_scale, fy=calibration['fy'] * args.focal_scale)
             poses, tracker_idx, pre = track(str(video), clip['camera_mode'], args.target_fps,
-                                            args.seed, calibration=clip['calibration'],
+                                            args.seed, calibration=calibration,
                                             frame_timestamps=frame_times,
                                             dpvo_buffer_size=args.dpvo_buffer_size)
             poses = np.asarray(poses, np.float64).reshape(-1, 7)

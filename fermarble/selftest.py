@@ -236,6 +236,54 @@ def multi_run_checks():
     check(info0['method'] == 'straight_line_fallback', 'no usable run -> straight-line fallback')
 
 
+def flow_speed_checks():
+    """Water-plane geometry (exact synthetic flow) and the flow-speed filter/gate."""
+    print('flow speed (water-plane fit, filter, gate)')
+    import flow_speed as fs
+    from common import filter_flow_speed
+    K = (900.0, 900.0, 480.0, 264.0)
+    gy, gx = np.mgrid[300:528:8, 4:960:8]
+    p = np.column_stack([gx.ravel(), gy.ravel()]).astype(float)
+    rays = np.column_stack([(p[:, 0] - K[2]) / K[0], (p[:, 1] - K[3]) / K[1], np.ones(len(p))])
+    u = fs.correction(-3.0, 1.0) @ np.array([0, -1.0, 0])          # camera pitched/rolled a little
+    u /= np.linalg.norm(u)
+    s = -(rays @ u)
+    keep = s > np.sin(np.radians(2))
+    p, rays, s = p[keep], rays[keep], s[keep]
+    fwd = np.array([0, 0, 1.0]) - u[2] * u
+    e1 = fwd / np.linalg.norm(fwd)
+    e2 = np.cross(e1, u)
+    R_ji = fs.rot_x(np.radians(0.8)) @ fs.rot_z(np.radians(-0.5)) @ fs.correction(0, 0)   # rocking
+    true_ab = np.array([0.35, -0.04])                                   # forward, slightly sideways
+    Xj = (rays / s[:, None] - (true_ab[0] * e1 + true_ab[1] * e2)) @ R_ji.T
+    flow = fs.project(K, Xj) - p
+    a, b_, rmse, n = fs.fit_translation(p, flow, rays, s, R_ji, e1, e2, K)
+    check(np.allclose([a, b_], true_ab, atol=1e-4) and rmse < 1e-3,
+          f'water-plane fit recovers the displacement under rotation ({a:.4f}, {b_:.4f} vs {true_ab})')
+    noisy = flow + np.random.default_rng(0).normal(0, 0.3, flow.shape)
+    noisy[:40] += 25.0                                                  # outliers (hull, boats)
+    a2, b2, _, _ = fs.fit_translation(p, noisy, rays, s, R_ji, e1, e2, K)
+    check(abs(a2 - true_ab[0]) < 0.01, f'robust fit tolerates noise and outliers (forward {a2:.4f})')
+    # filter: known profile, bands = profile x independent noise
+    t = np.arange(0, 300, 0.125)
+    prof = 1 + 1.5 * np.exp(-0.5 * ((t - 150) / 30) ** 2)
+    rng = np.random.default_rng(1)
+    d = dict(t_mid=t, speed_near=3 * prof * np.exp(rng.normal(0, .05, len(t))),
+             speed_far=7 * prof * np.exp(rng.normal(0, .05, len(t))))
+    sp, info = filter_flow_speed(d, t, dict(agree_tol=0.4, window_s=2.0))
+    ratio = sp / prof
+    check(info['speed_fallback'] == 'none' and ratio.std() / ratio.mean() < 0.02,
+          f"filter reproduces the speed profile shape (relative std {ratio.std() / ratio.mean():.4f})")
+    d_bad = dict(d, speed_far=d['speed_far'] * np.exp(rng.normal(0, 1.5, len(t))))
+    _, info_bad = filter_flow_speed(d_bad, t, dict(agree_tol=0.2, min_reliable_frac=0.5))
+    check(info_bad['speed_fallback'] == 'clip', 'disagreeing bands -> whole clip falls back to constant speed')
+    flat = dict(d, speed_near=3 * np.exp(rng.normal(0, .05, len(t))), speed_far=7 * np.exp(rng.normal(0, .05, len(t))))
+    spg, info_g = filter_flow_speed(flat, t, dict(gate_stat='cv', gate_min=0.2))
+    _, info_v = filter_flow_speed(d, t, dict(gate_stat='cv', gate_min=0.2))
+    check(info_g['speed_fallback'] == 'gate' and np.all(spg == 1) and info_v['speed_fallback'] == 'none',
+          f"gate keeps constant speed for a steady clip (CV {info_g['flow_cv']:.3f}) and flow for a varying one (CV {info_v['flow_cv']:.3f})")
+
+
 def unit_checks():
     print('unit checks')
     rng = np.random.default_rng(0)
@@ -352,6 +400,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
     unit_checks()
     multi_run_checks()
+    flow_speed_checks()
     tmp = None
     if args.keep:
         work = args.keep

@@ -408,16 +408,71 @@ def flow_speed_profile(d, frame_times, band='all', window_s=2.0):
     return np.interp(frame_times, d['t_mid'], sm)
 
 
+def horizon_jump(d):
+    """Largest change (deg) of flow_speed.py's per-window horizon pitch correction: a horizon
+    fit that jumps between windows (shoreline vs. horizon, wrong DPVO attitude) is suspect."""
+    hw = np.asarray(d['horizon_windows'], float) if 'horizon_windows' in d else np.zeros((0, 3))
+    return float(np.abs(np.diff(hw[:, 1])).max()) if hw.ndim == 2 and len(hw) > 1 else 0.0
+
+
+def flow_quality_features(d, agree_tol=0.6):
+    """Per-clip quality signals of a flow_speed.py result, computable without ground truth:
+    reliable_frac   pairs whose near/far bands agree within agree_tol (log)
+    ratio_std       std of log(near/far) (bands normalised by their clip medians)
+    side_frac       median |sideways| / |displacement| of the fit (boats mostly move forward)
+    backward_frac   pairs whose fitted motion points backwards (a < 0)
+    rmse_px         median fit residual (px)
+    horizon_jump    largest change of the per-window horizon pitch correction (deg)
+    horizon_spread  range of the per-window horizon pitch correction (deg)
+    slow_frac       pairs slower than 0.3 x the clip median (all band)"""
+    near, far = np.asarray(d['speed_near'], float), np.asarray(d['speed_far'], float)
+    ok = np.isfinite(near) & np.isfinite(far) & (near > 0) & (far > 0)
+    a, b = np.asarray(d['a_all'], float), np.asarray(d['b_all'], float)
+    fin = np.isfinite(a) & np.isfinite(b) & (np.hypot(a, b) > 0)
+    allsp = np.asarray(d['speed_all'], float)
+    f = dict(valid_frac=float(fin.mean()))
+    if ok.sum() >= 10:
+        lr = np.log((near[ok] / np.median(near[ok])) / (far[ok] / np.median(far[ok])))
+        f.update(reliable_frac=float((np.abs(lr) <= agree_tol).sum() / len(near)), ratio_std=float(lr.std()))
+    else:
+        f.update(reliable_frac=0.0, ratio_std=float('nan'))
+    if fin.sum() >= 10:
+        f.update(side_frac=float(np.median(np.abs(b[fin]) / np.hypot(a[fin], b[fin]))),
+                 backward_frac=float((a[fin] < 0).mean()),
+                 rmse_px=float(np.nanmedian(np.asarray(d['rmse_all'], float)[fin])),
+                 slow_frac=float((allsp[fin] < 0.3 * np.median(allsp[fin])).mean()))
+    else:
+        f.update(side_frac=float('nan'), backward_frac=float('nan'), rmse_px=float('nan'), slow_frac=float('nan'))
+    hw = np.asarray(d['horizon_windows'], float) if 'horizon_windows' in d else np.zeros((0, 3))
+    if hw.ndim == 2 and len(hw) > 1:
+        f.update(horizon_jump=float(np.abs(np.diff(hw[:, 1])).max()), horizon_spread=float(np.ptp(hw[:, 1])))
+    else:
+        f.update(horizon_jump=0.0, horizon_spread=0.0)
+    return f
+
+
 # Thresholds of filter_flow_speed. Defaults are placeholders; oracle.py --speed-tune fits them on
 # TRAIN clips only and writes them to a JSON file that make_predictions.py --speed-params reads.
 # (NO_LIMIT instead of inf so the parameters stay valid JSON.)
 NO_LIMIT = 1e6
 FLOW_FILTER_DEFAULTS = dict(agree_tol=0.5, window_s=2.0, clamp_lo=0.0, clamp_hi=NO_LIMIT,
-                            min_reliable_frac=0.3)
+                            min_reliable_frac=0.3, gate_stat='none', gate_min=0.0,
+                            side_max=NO_LIMIT, drop_backward=False, horizon_jump_max=NO_LIMIT)
 
 
-def flow_reliable_speed(d, agree_tol):
+def speed_variation(speed):
+    """Per-clip variation of a relative speed profile, for the flow gate: (CV, max/median)."""
+    speed = np.asarray(speed, float)
+    med = float(np.median(speed))
+    return float(speed.std() / speed.mean()), float(speed.max() / med) if med > 0 else float('inf')
+
+
+def flow_reliable_speed(d, agree_tol, side_max=NO_LIMIT, drop_backward=False):
     """Stage 1 of filter_flow_speed: normalised near/far bands, agreement test, geometric mean.
+    A pair is also unreliable when its fitted motion is more than side_max sideways
+    (|sideways| / |displacement|) or, with drop_backward, points backwards: a boat under way
+    moves forwards, so these flag scenes the water-plane model does not explain (harbour
+    clutter, docking, side-looking views).
     Returns (t_mid, speed or NaN where unreliable, reliable fraction, n usable pairs)."""
     near = np.asarray(d['speed_near'], float)
     far = np.asarray(d['speed_far'], float)
@@ -429,6 +484,12 @@ def flow_reliable_speed(d, agree_tol):
     ff = far / np.median(far[ok])
     with np.errstate(divide='ignore', invalid='ignore'):
         agree = ok & (np.abs(np.log(nn / ff)) <= agree_tol)
+        if side_max < 1.0 or drop_backward:
+            a, b = np.asarray(d['a_all'], float), np.asarray(d['b_all'], float)
+            if side_max < 1.0:
+                agree &= np.abs(b) <= side_max * np.hypot(a, b)
+            if drop_backward:
+                agree &= a > 0
     return t, np.where(agree, np.sqrt(nn * ff), np.nan), float(agree.mean()), int(agree.sum())
 
 
@@ -451,15 +512,25 @@ def filter_flow_speed(d, frame_times, params=None):
     3. Clamp to [clamp_lo, clamp_hi] x the clip median of the reliable speeds.
     4. Pairs with no reliable value in their window get the clip median. If fewer than
        min_reliable_frac of the pairs are reliable, the whole clip falls back to constant speed.
+    5. Gate: if gate_stat is 'cv' or 'maxmed' and the profile's own variation (speed_variation)
+       is below gate_min, the clip keeps constant speed (flow only where speed really varies).
     Returns (speed at frame_times, info). Units are relative (clip median = 1).
     """
     p = dict(FLOW_FILTER_DEFAULTS, **(params or {}))
     frame_times = np.asarray(frame_times, float)
-    t, v, rel_frac, n_rel = flow_reliable_speed(d, p['agree_tol'])
+    jump = horizon_jump(d)
+    if jump > p['horizon_jump_max']:
+        return np.ones(len(frame_times)), dict(speed_fallback='horizon', horizon_jump=jump, reliable_frac=np.nan,
+                                               fallback_frac=1.0)
+    t, v, rel_frac, n_rel = flow_reliable_speed(d, p['agree_tol'], p['side_max'], p['drop_backward'])
     if rel_frac < p['min_reliable_frac'] or n_rel < 10:
         return np.ones(len(frame_times)), dict(speed_fallback='clip', reliable_frac=rel_frac, fallback_frac=1.0)
     speed, filled = flow_speed_from_reliable(t, v, frame_times, p['window_s'], p['clamp_lo'], p['clamp_hi'])
-    return speed, dict(speed_fallback='none', reliable_frac=rel_frac, fallback_frac=filled)
+    cv, maxmed = speed_variation(speed)
+    info = dict(reliable_frac=rel_frac, fallback_frac=filled, flow_cv=cv, flow_maxmed=maxmed)
+    if p['gate_stat'] != 'none' and {'cv': cv, 'maxmed': maxmed}[p['gate_stat']] < p['gate_min']:
+        return np.ones(len(frame_times)), dict(info, speed_fallback='gate')
+    return speed, dict(info, speed_fallback='none')
 
 
 # --------------------------------------------------------------------------------------

@@ -27,7 +27,8 @@ import numpy as np
 
 from common import (DEFAULT_DATASET, NO_LIMIT, REPO_ROOT, SMOOTH_SIGMA_S, START_WINDOW_S, clean_poses,
                     filter_flow_speed, flow_reliable_speed, flow_speed_from_reliable, multi_run_heading,
-                    read_json, rolling_median, gap_aware_coverage,
+                    read_json, rolling_median, speed_variation, flow_quality_features, horizon_jump,
+                    quat_to_rotmat, estimate_up, forward_motion_cosine, gap_aware_coverage,
                     forward_motion_cosine, heading_at_frames, heading_constant_speed, integrate_planar, load_manifest,
                     load_pose_npz, load_timestamps, motion_heading, pose_heading, select_clips,
                     smooth_in_time, straight_line, write_json)
@@ -447,8 +448,12 @@ def flow_diag(root, clip, speed_npz, out_png, med3_dirs=()):
 # --------------------------------------------------------------------------------------
 # Flow speed: tuning (train only) and evaluation
 # --------------------------------------------------------------------------------------
-TUNE_GRID = dict(agree_tol=[0.15, 0.25, 0.4, 0.6, 1.0, NO_LIMIT], window_s=[1.0, 2.0, 4.0, 8.0],
-                 clamp_lo=[0.0, 0.1, 0.25], clamp_hi=[3.0, 6.0, NO_LIMIT], min_reliable_frac=[0.0, 0.25, 0.5])
+TUNE_GRID = dict(agree_tol=[0.25, 0.4, 0.6, 1.0], window_s=[4.0, 8.0], clamp_lo=[0.0, 0.25], clamp_hi=[NO_LIMIT],
+                 min_reliable_frac=[0.0, 0.5, 0.6, 0.7, 0.8, 0.9], side_max=[NO_LIMIT, 0.3, 0.5, 0.7],
+                 drop_backward=[False, True])
+# Per-clip rules applied after the filter (cheap: per-clip features, no re-scoring).
+GATE_CV = [0.0, 0.2, 0.25, 0.3, 0.35, 0.4]
+GATE_HJUMP = [NO_LIMIT, 2.0, 2.5, 3.0, 3.5]
 
 
 def speed_clip_data(root, clip, speed_npz, heading_pose_paths, sigma_s=SMOOTH_SIGMA_S):
@@ -475,42 +480,66 @@ def _score_speed(data, heading, speed):
 
 
 def _tune_clip(args):
-    """All TUNE_GRID combinations on one clip -> array [n_combos, 2] (true heading, med3 heading)."""
+    """All TUNE_GRID filter combinations on one clip. Returns (key, (flow scores [n_combos, 2]
+    (true heading, med3 heading), constant-speed scores [2], flow CV [n_combos] (0 where the
+    filter fell back to constant), horizon jump)). Per-clip gates are applied afterwards."""
     root, clip, speed_npz, pose_paths = args
     data = speed_clip_data(root, clip, speed_npz, pose_paths)
+    ones = np.ones(len(data['frame_t']))
+    const = np.array([_score_speed(data, data['thf'], ones), _score_speed(data, data['med3'], ones)])
     g = TUNE_GRID
-    out = []
+    out, cvs = [], []
     for tol in g['agree_tol']:
-        t, v, rel, n_rel = flow_reliable_speed(data['d'], tol)
-        for win in g['window_s']:
-            sm = rolling_median(t, v, win) if n_rel >= 10 else None
-            for lo in g['clamp_lo']:
-                for hi in g['clamp_hi']:
-                    for mf in g['min_reliable_frac']:
-                        if rel < mf or n_rel < 10:
-                            sp = np.ones(len(data['frame_t']))
-                        else:
-                            sp, _ = flow_speed_from_reliable(t, v, data['frame_t'], win, lo, hi, smoothed=sm)
-                        out.append((_score_speed(data, data['thf'], sp), _score_speed(data, data['med3'], sp)))
-    return clip['key'], np.array(out)
+        for side in g['side_max']:
+            for back in g['drop_backward']:
+                t, v, rel, n_rel = flow_reliable_speed(data['d'], tol, side, back)
+                for win in g['window_s']:
+                    sm = rolling_median(t, v, win) if n_rel >= 10 else None
+                    for lo in g['clamp_lo']:
+                        for hi in g['clamp_hi']:
+                            sp = None
+                            for mf in g['min_reliable_frac']:
+                                if rel < mf or n_rel < 10:
+                                    out.append(tuple(const))
+                                    cvs.append(0.0)
+                                    continue
+                                if sp is None:
+                                    sp, _ = flow_speed_from_reliable(t, v, data['frame_t'], win, lo, hi, smoothed=sm)
+                                    sc = (_score_speed(data, data['thf'], sp), _score_speed(data, data['med3'], sp))
+                                out.append(sc)
+                                cvs.append(speed_variation(sp)[0])
+    return clip['key'], (np.array(out), const, np.array(cvs), horizon_jump(data['d']))
 
 
 def tune_speed(root, clips, speed_dir, pose_dirs, workers=8):
-    """Fit filter_flow_speed thresholds on the given (TRAIN) clips: minimise mean drift of
-    med3 heading + flow speed. Returns (best params, table rows)."""
+    """Fit filter_flow_speed thresholds and the per-clip gates on the given (TRAIN) clips:
+    minimise the mean drift of med3 heading + flow speed. Returns (best params, rows, n clips)."""
     from concurrent.futures import ProcessPoolExecutor
     import itertools
-    combos = list(itertools.product(*TUNE_GRID.values()))
+    order = ['agree_tol', 'side_max', 'drop_backward', 'window_s', 'clamp_lo', 'clamp_hi', 'min_reliable_frac']
+    combos = list(itertools.product(*(TUNE_GRID[k] for k in order)))   # same nesting as _tune_clip
     jobs = [(root, c, speed_dir / 'speed' / f"{c['key']}.npz", [d / 'poses' / f"{c['key']}.npz" for d in pose_dirs])
             for c in clips if (speed_dir / 'speed' / f"{c['key']}.npz").is_file()]
     with ProcessPoolExecutor(workers) as ex:
         res = dict(ex.map(_tune_clip, jobs))
-    A = np.stack([res[k] for k in sorted(res)])          # clips x combos x 2
-    mean = np.nanmean(A, axis=0)
-    order = np.argsort(mean[:, 1])
-    rows = [dict(zip(TUNE_GRID, combos[i]), mean_true_head_flow=float(mean[i, 0]),
-                 mean_med3_flow=float(mean[i, 1])) for i in order]
-    return dict(zip(TUNE_GRID, combos[order[0]])), rows, len(res)
+    keys = sorted(res)
+    S = np.stack([res[k][0] for k in keys])              # clips x combos x 2
+    C = np.stack([res[k][1] for k in keys])              # clips x 2
+    CV = np.stack([res[k][2] for k in keys])             # clips x combos
+    HJ = np.array([res[k][3] for k in keys])             # clips
+    rows = []
+    for cvmin in GATE_CV:
+        for hjmax in GATE_HJUMP:
+            use = (CV >= cvmin) & (HJ[:, None] <= hjmax) & (CV > 0)
+            G = np.where(use[..., None], S, C[:, None, :])
+            mean = np.nanmean(G, axis=0)
+            for i, combo in enumerate(combos):
+                rows.append(dict(zip(order, combo), gate_stat='cv' if cvmin > 0 else 'none', gate_min=cvmin,
+                                 horizon_jump_max=hjmax, mean_true_head_flow=float(mean[i, 0]),
+                                 mean_med3_flow=float(mean[i, 1]), flow_used_frac=float(use[:, i].mean())))
+    rows.sort(key=lambda r: r['mean_med3_flow'])
+    best = {k: rows[0][k] for k in order + ['gate_stat', 'gate_min', 'horizon_jump_max']}
+    return best, rows, len(keys)
 
 
 def speed_eval_clip(args):
@@ -537,6 +566,33 @@ SPEED_VARIANTS = ['true_head_const', 'true_head_flow', 'true_head_true_speed',
                   'med3_const', 'med3_flow', 'med3_true_speed']
 
 
+DESIGN_CLIPS = ('clip_021', 'clip_038', 'clip_077')   # used to design the flow-speed method
+
+
+def paired_report(rows, base='med3_const', new='med3_flow', tol=0.5):
+    """Per-clip change of `new` vs `base` on the clips that use flow speed: how many get better /
+    worse by more than tol points, by how much, and separately for clips where the baseline is
+    already good (< 10 %). With and without the design clips, train and val separately."""
+    lines = [f'== per clip: {new} vs {base} (clips using flow speed; change in drift points, '
+             f'better/worse = beyond +-{tol})',
+             f"{'group':<30}{'n':>4}{'better':>8}{'worse':>7}{'mean chg':>10}{'mean gain':>11}{'mean loss':>11}"
+             f"{'worst loss':>12}"]
+    for split in ('train', 'val', 'train+val'):
+        for excl in (False, True):
+            for good in (False, True):
+                g = [r for r in rows if r['uses_flow'] and (split == 'train+val' or r['split'] == split)
+                     and not (excl and r['key'] in DESIGN_CLIPS) and (not good or r[base] < 10)]
+                if not g:
+                    continue
+                dlt = np.array([r[new] - r[base] for r in g])
+                b, w = dlt < -tol, dlt > tol
+                name = f"{split}{' -design' if excl else ''}{' base<10%' if good else ''}"
+                lines.append(f'{name:<30}{len(g):>4}{b.sum():>8}{w.sum():>7}{dlt.mean():>+10.2f}'
+                             f"{(dlt[b].mean() if b.any() else 0):>+11.2f}{(dlt[w].mean() if w.any() else 0):>+11.2f}"
+                             f'{dlt.max():>+12.2f}')
+    return '\n'.join(lines)
+
+
 def speed_report(rows, worst_keys):
     def block(title, groups):
         lines = [f'== {title} (mean drift %)',
@@ -554,9 +610,11 @@ def speed_report(rows, worst_keys):
     out = []
     for split in ('train', 'val'):
         g = [r for r in rows if r['split'] == split]
-        out.append(block(f'{split}', [('all', g), ('all except zoom', [r for r in g if r['camera_mode'] != 'zoom'])]
+        out.append(block(f'{split}', [('all', g), ('all except zoom', [r for r in g if r['camera_mode'] != 'zoom']),
+                                      ('all exc. design clips', [r for r in g if r['key'] not in DESIGN_CLIPS])]
                          + [(m, [r for r in g if r['camera_mode'] == m]) for m in modes]))
     out.append(block('train+val', [('all', rows), ('all except zoom', [r for r in rows if r['camera_mode'] != 'zoom'])]))
+    out.append(paired_report(rows))
     w = [r for r in rows if r['key'] in worst_keys]
     out.append(block('15 worst clips of the earlier table', [('worst 15', w)]))
     lines = [f"{'clip':<10}{'split':<6}{'mode':<9}" + ''.join(f'{v:>15}' for v in SPEED_VARIANTS) + '  fallback']
@@ -565,6 +623,169 @@ def speed_report(rows, worst_keys):
                      + f"  {r['speed_fallback']} ({r['fallback_frac'] if r['uses_flow'] else float('nan'):.2f})")
     out.append('\n'.join(lines))
     return '\n\n'.join(out)
+
+
+def flow_failure_diag(root, clip, speed_npz, params, out_png, frames_png=None, pose_dirs=()):
+    """Why flow speed fails on a clip: flow (raw bands + filtered) vs true speed, band agreement,
+    sideways fraction / fit residual, horizon correction; optionally frames with the water region
+    at the moments of largest speed error. Returns the error times."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    d = dict(np.load(speed_npz))
+    ref_t, ref_xyz = load_reference(root, clip)
+    frame_t = load_timestamps(root, clip)
+    gt, gv = true_speed_series(ref_t, ref_xyz)
+    prof, info = filter_flow_speed(d, frame_t, params)
+    raw, _ = filter_flow_speed(d, frame_t, dict(params, gate_stat='none', min_reliable_frac=0.0))
+    tr = np.interp(frame_t, gt, gv)
+    tr_n = tr / np.median(tr)
+    t = d['t_mid']
+    fig, ax = plt.subplots(4, 1, figsize=(11, 10), sharex=True, gridspec_kw=dict(height_ratios=[3, 1.3, 1.3, 1]))
+    ax[0].plot(gt, gv / np.median(gv), 'k', lw=2, label='true speed / median')
+    for band, col in (('near', 'tab:orange'), ('far', 'tab:green')):
+        v = d[f'speed_{band}']
+        ax[0].plot(t, v / np.nanmedian(v), color=col, lw=0.4, alpha=0.5, label=f'flow {band} (raw)')
+    ax[0].plot(frame_t, raw / np.median(raw), 'r', lw=1.3, label='flow, filtered (no gate)')
+    ax[0].set_ylim(0, 4)
+    ax[0].set_ylabel('speed / clip median')
+    ax[0].legend(fontsize=7, loc='upper left', ncol=2)
+    near, far = d['speed_near'], d['speed_far']
+    with np.errstate(divide='ignore', invalid='ignore'):
+        lr = np.log((near / np.nanmedian(near)) / (far / np.nanmedian(far)))
+    ax[1].plot(t, lr, lw=0.4)
+    ax[1].axhline(params['agree_tol'], color='r', lw=0.8)
+    ax[1].axhline(-params['agree_tol'], color='r', lw=0.8)
+    ax[1].set_ylim(-2, 2)
+    ax[1].set_ylabel('log near/far')
+    a, b = d['a_all'], d['b_all']
+    side = np.abs(b) / np.hypot(a, b)
+    ax[2].plot(t, rolling_median(t, side, 4.0), 'tab:purple', lw=1, label='sideways fraction (4 s median)')
+    ax[2].plot(t, (a < 0).astype(float) * 0.95, 'k.', ms=1, label='backward motion')
+    ax[2].set_ylim(0, 1)
+    ax2 = ax[2].twinx()
+    ax2.plot(t, rolling_median(t, d['rmse_all'], 4.0), 'tab:gray', lw=1)
+    ax2.set_ylabel('fit rmse px', color='tab:gray')
+    ax[2].legend(fontsize=7, loc='upper left')
+    ax[3].plot(d['times'], d['horizon_pitch_deg'], label='horizon pitch corr.')
+    ax[3].plot(d['times'], d['horizon_roll_deg'], label='roll corr.')
+    ax[3].set_ylabel('deg')
+    ax[3].legend(fontsize=7)
+    ax[3].set_xlabel('time (s)')
+    fq = flow_quality_features(d, params['agree_tol'])
+    ax[0].set_title(f"{clip['key']} ({clip['split']}, {clip['camera_mode']}) decision={info['speed_fallback']}  "
+                    f"CV {info.get('flow_cv', float('nan')):.2f}  reliable {fq['reliable_frac']:.2f}  "
+                    f"side {fq['side_frac']:.2f}  backward {fq['backward_frac']:.2f}  rmse {fq['rmse_px']:.2f}px  "
+                    f"horizon jump {fq['horizon_jump']:.1f}deg", fontsize=8)
+    # moments of largest error (log ratio of normalised flow vs truth), >= 40 s apart
+    err = np.abs(np.log(np.maximum(raw / np.median(raw), 1e-3) / np.maximum(tr_n, 1e-3)))
+    picks = []
+    for i in np.argsort(-err):
+        if all(abs(frame_t[i] - frame_t[j]) > 40 for j in picks):
+            picks.append(int(i))
+        if len(picks) == 3:
+            break
+    for i in picks:
+        for x in ax:
+            x.axvline(frame_t[i], color='m', lw=0.8, ls='--')
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=95)
+    plt.close(fig)
+    if frames_png is not None:
+        render_flow_frames(root, clip, d, pose_dirs, [frame_t[i] for i in picks],
+                           [(tr_n[i], raw[i] / np.median(raw)) for i in picks], frames_png)
+    return [float(frame_t[i]) for i in picks]
+
+
+def render_flow_frames(root, clip, d, pose_dirs, times_s, speeds, out_png):
+    """Frames at times_s with horizon and water region, labelled with true and flow speed."""
+    import flow_speed as fs
+    fs.render_frames(root, clip, d, pose_dirs, times_s,
+                     [f'true {tv:.2f} flow {fv:.2f} (x median)' for tv, fv in speeds], out_png)
+
+
+def heading_seeds_plot(root, clip, pose_dirs, out_png, sigma_s=SMOOTH_SIGMA_S):
+    """True heading vs each DPVO run's heading (turned since start, clockwise +) and their
+    circular median, plus the true speed. Returns per-run stats."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    frame_t = load_timestamps(root, clip)
+    ref_t, ref_xyz = load_reference(root, clip)
+    th, tv = true_motion(ref_t, ref_xyz)
+    mid = 0.5 * (ref_t[1:] + ref_t[:-1])
+    g, ths = smooth_in_time(mid, th, sigma_s)
+    true_f = np.interp(frame_t, g, ths)
+    start = frame_t <= frame_t[0] + START_WINDOW_S
+    true_turn = np.degrees(true_f - true_f[start].mean())
+    fig, ax = plt.subplots(3, 1, figsize=(11, 8), sharex=True, gridspec_kw=dict(height_ratios=[3, 2, 1]))
+    ax[0].plot(frame_t, true_turn, 'k', lw=2, label='true (direction of travel)')
+    stats, runs = [], []
+    for pd, col in zip(pose_dirs, ('tab:blue', 'tab:orange', 'tab:green')):
+        pp = pd / 'poses' / f"{clip['key']}.npz"
+        z = load_pose_npz(pp)
+        runs.append((z['poses'], z['times']))
+        poses, pt = clean_poses(z['poses'], z['times'])
+        st = dict(run=pd.name, finite=int(np.isfinite(z['poses']).all(1).sum()), n=len(z['poses']))
+        if poses is not None:
+            h, _ = pose_heading(poses, pt)
+            hf = np.degrees(heading_at_frames(pt, h, frame_t, sigma_s))
+            ax[0].plot(frame_t, hf, color=col, lw=1, label=f'DPVO {pd.name}')
+            dif = np.angle(np.exp(1j * np.radians(hf - true_turn)), deg=True)
+            ax[1].plot(frame_t, dif, color=col, lw=1)
+            st.update(fwd_cos=forward_motion_cosine(poses, pt), span_dpvo=float(np.ptp(hf)), span_true=float(np.ptp(true_turn)),
+                      end_diff=float(dif[-50:].mean()))
+        stats.append(st)
+    hm, _ = multi_run_heading(runs, frame_t, sigma_s)
+    if hm is not None:
+        ax[0].plot(frame_t, np.degrees(hm), 'r--', lw=1.2, label='circular median')
+    ax[0].set_ylabel('turned since start (deg), clockwise +')
+    ax[0].legend(fontsize=7)
+    ax[1].axhline(0, color='0.7')
+    ax[1].set_ylabel('DPVO - true (deg)')
+    gs, vs = true_speed_series(ref_t, ref_xyz)
+    ax[2].plot(gs, vs, 'tab:green')
+    ax[2].set_ylabel('true speed m/s')
+    ax[2].set_xlabel('time (s)')
+    ax[0].set_title(f"{clip['key']} ({clip['split']}, {clip['camera_mode']}): DPVO heading per seed vs true", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=95)
+    plt.close(fig)
+    return stats
+
+
+def heading_scale(root, clip, pose_dirs, sigma_s=SMOOTH_SIGMA_S):
+    """Least-squares slope of the median DPVO heading against the true heading (both turned since
+    the start, smoothed alike). 1 = DPVO turns as much as the boat; 2 = twice as much (e.g. the
+    focal length used is half the true one)."""
+    frame_t = load_timestamps(root, clip)
+    ref_t, ref_xyz = load_reference(root, clip)
+    th, _ = true_motion(ref_t, ref_xyz)
+    mid = 0.5 * (ref_t[1:] + ref_t[:-1])
+    g, ths = smooth_in_time(mid, th, sigma_s)
+    true_f = np.interp(frame_t, g, ths)
+    start = frame_t <= frame_t[0] + START_WINDOW_S
+    tt = np.degrees(true_f - true_f[start].mean())
+    runs = []
+    for pd in pose_dirs:
+        pp = pd / 'poses' / f"{clip['key']}.npz"
+        if pp.is_file():
+            z = load_pose_npz(pp)
+            runs.append((z['poses'], z['times']))
+    h, _ = multi_run_heading(runs, frame_t, sigma_s)
+    if h is None or np.ptp(tt) < 15:
+        return dict(key=clip['key'], camera_mode=clip['camera_mode'], split=clip['split'], scale=np.nan,
+                    true_span=float(np.ptp(tt)))
+    dh = np.degrees(h)
+    slope = float((dh @ tt) / (tt @ tt))
+    first = frame_t <= frame_t[0] + 120  # first 2 minutes (before late tracking failures)
+    slope120 = float((dh[first] @ tt[first]) / (tt[first] @ tt[first])) if np.ptp(tt[first]) >= 15 else np.nan
+    return dict(key=clip['key'], camera_mode=clip['camera_mode'], split=clip['split'], scale=slope,
+                scale_first120=slope120, true_span=float(np.ptp(tt)))
+
+
+def _failure_job(args):
+    return flow_failure_diag(*args)
 
 
 def group_means(rows, key_fn):
@@ -659,6 +880,16 @@ def main(argv=None):
         report = speed_report(rows, worst)
         (args.output / 'speed_eval.txt').write_text(report + '\n')
         print(report)
+        return 0
+    if args.flow_diag and args.speed_params:  # failure analysis with the tuned filter
+        from concurrent.futures import ProcessPoolExecutor
+        params = read_json(args.speed_params)
+        args.output.mkdir(parents=True, exist_ok=True)
+        jobs = [(root, c, args.flow_diag / 'speed' / f"{c['key']}.npz", params, args.output / f"diag_{c['key']}.png",
+                 args.output / f"frames_{c['key']}.jpg", args.heading_poses or ()) for c in selected]
+        with ProcessPoolExecutor(min(args.workers, len(jobs))) as ex:
+            for c, picks in zip(selected, ex.map(_failure_job, jobs)):
+                print(c['key'], 'largest-error times', [round(x) for x in picks], flush=True)
         return 0
     if args.flow_diag:
         args.output.mkdir(parents=True, exist_ok=True)

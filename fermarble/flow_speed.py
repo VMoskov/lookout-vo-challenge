@@ -278,6 +278,45 @@ def process_clip(root, clip, pose_paths, out_path, target_fps=8.0):
                 decode_s=round(t_dec, 1), flow_s=round(t_flow, 1), total_s=round(time.time() - t0, 1))
 
 
+def render_frames(root, clip, d, pose_dirs, times_s, labels, out_png, width=640):
+    """Frames at times_s with the fitted horizon (red) and the water sample points (green).
+    Never reads references (labels are supplied by the caller)."""
+    frames, dec, times, K = clip_frames(root, clip, 8.0)
+    z, _ = best_pose_run([pd / 'poses' / f"{clip['key']}.npz" for pd in pose_dirs])
+    R = quat_to_rotmat(np.where(np.isfinite(z['poses'][:, 3:7]), z['poses'][:, 3:7], [0, 0, 0, 1]))
+    U = estimate_up(R[np.isfinite(z['poses']).all(1)])
+    H, W = frames[0].shape
+    gy, gx = np.mgrid[GRID_STEP // 2:H:GRID_STEP, GRID_STEP // 2:W:GRID_STEP]
+    p = np.column_stack([gx.ravel(), gy.ravel()]).astype(float)
+    fx, fy, cx, cy = K
+    rays = np.column_stack([(p[:, 0] - cx) / fx, (p[:, 1] - cy) / fy, np.ones(len(p))])
+    tiles = []
+    for ts, label in zip(times_s, labels):
+        k = int(np.argmin(np.abs(times - ts)))
+        u = correction(d['horizon_pitch_deg'][k], d['horizon_roll_deg'][k]) @ (R[k].T @ U)
+        u /= np.linalg.norm(u)
+        water, _ = water_region(rays, u, np.zeros(len(p), bool))
+        im = cv2.cvtColor(frames[k], cv2.COLOR_GRAY2BGR)
+        for (x, y) in p[water].astype(int):
+            cv2.circle(im, (x, y), 1, (0, 255, 0), -1)
+        xs = np.arange(0, W, 3.0)
+        for x, y in zip(xs, horizon_rows(u, K, xs)):
+            if np.isfinite(y) and 0 <= y < H:
+                cv2.circle(im, (int(x), int(y)), 1, (0, 0, 255), -1)
+        cv2.putText(im, f"{clip['key']} {clip['camera_mode']} t={times[k]:.0f}s {label}", (8, 28), 0, 0.8, (0, 255, 255), 2)
+        tiles.append(cv2.resize(im, (width, int(width * H / W))))
+    w = max(t.shape[1] for t in tiles)
+    cv2.imwrite(str(out_png), np.vstack([cv2.copyMakeBorder(t, 0, 0, 0, w - t.shape[1], cv2.BORDER_CONSTANT) for t in tiles]))
+
+
+def _render_job(args):
+    root, clip, npz, pose_dirs, out_png = args
+    d = dict(np.load(npz))
+    ts = np.quantile(d['times'], [0.15, 0.5, 0.85])
+    render_frames(root, clip, d, pose_dirs, ts, ['' for _ in ts], out_png, width=480)
+    return clip['key']
+
+
 def _job(args):
     root, clip, pose_paths, out_path = args
     try:
@@ -297,12 +336,23 @@ def main(argv=None):
     ap.add_argument('--output', required=True, type=Path)
     ap.add_argument('--workers', type=int, default=6)
     ap.add_argument('--overwrite', action='store_true')
+    ap.add_argument('--render', action='store_true',
+                    help='only render a geometry check (3 frames with horizon/water) per processed clip')
     args = ap.parse_args(argv)
     cv2.setNumThreads(2)
     root = args.dataset.resolve().parent
     clips = select_clips(load_manifest(args.dataset), args.split, args.clips)
     if args.modes != 'all':
         clips = [c for c in clips if c['camera_mode'] in args.modes.split(',')]
+    if args.render:
+        out_dir = args.output / 'geometry'
+        out_dir.mkdir(parents=True, exist_ok=True)
+        jobs = [(root, c, args.output / 'speed' / f"{c['key']}.npz", args.poses, out_dir / f"{c['key']}.jpg")
+                for c in clips if (args.output / 'speed' / f"{c['key']}.npz").is_file()]
+        with ProcessPoolExecutor(args.workers) as ex:
+            for k in ex.map(_render_job, jobs):
+                print('rendered', k, flush=True)
+        return 0
     jobs = []
     for c in clips:
         out = args.output / 'speed' / f"{c['key']}.npz"

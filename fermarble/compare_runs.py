@@ -22,6 +22,9 @@ def main(argv=None):
     ap.add_argument('--dataset', type=Path, default=DEFAULT_DATASET)
     ap.add_argument('--clips-of', help='also list per-clip drift for these camera modes (comma-separated)')
     ap.add_argument('--csv', type=Path, help='write the group table to this CSV')
+    ap.add_argument('--exclude', help='comma-separated clip IDs to leave out (e.g. clips used for design)')
+    ap.add_argument('--paired', action='store_true',
+                    help='also count clips better/worse (> 0.5 points) than the first run, per group')
     args = ap.parse_args(argv)
     mode = {c['key']: c['camera_mode'] for c in load_manifest(args.dataset)['clips']}
     split = {c['key']: c['split'] for c in load_manifest(args.dataset)['clips']}
@@ -30,7 +33,7 @@ def main(argv=None):
         label, path = spec.split('=', 1)
         res = read_json(Path(path) / 'results.json')
         runs[label] = {r['key']: (r['drift_pct'] if r['status'] == 'scored' else np.nan) for r in res}
-    keys = sorted(set.intersection(*(set(r) for r in runs.values())))
+    keys = sorted(set.intersection(*(set(r) for r in runs.values())) - set((args.exclude or '').split(',')))
     groups = [('all', keys), ('all except zoom', [k for k in keys if mode[k] != 'zoom'])]
     groups += [(s, [k for k in keys if split[k] == s]) for s in ('train', 'val')]
     groups += [(m, [k for k in keys if mode[k] == m])
@@ -54,6 +57,19 @@ def main(argv=None):
         rows.append(row)
         print(f'{name:<17}{len(ks):>4}' + cells)
     print('cells: mean/median drift %, (change of the mean vs the first run)')
+    if args.paired:
+        print(f"\nper clip vs {base}: better / worse by > 0.5 points, mean change; [base < 10 %: better / worse]")
+        for name, ks in groups:
+            if not ks:
+                continue
+            b = np.array([runs[base][k] for k in ks], float)
+            line = f'{name:<17}{len(ks):>4}'
+            for l in labels[1:]:
+                dl = np.array([runs[l][k] for k in ks], float) - b
+                good = b < 10
+                line += (f'  {l}: {(dl < -.5).sum()}/{(dl > .5).sum()} {np.nanmean(dl):+.2f}'
+                         f' [{(dl[good] < -.5).sum()}/{(dl[good] > .5).sum()}]')
+            print(line)
     if args.clips_of:
         wanted = set(args.clips_of.split(','))
         print(f"\n{'clip':<10}{'mode':<10}" + ''.join(f'{l:>14}' for l in labels))

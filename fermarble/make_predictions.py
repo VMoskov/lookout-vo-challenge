@@ -54,8 +54,8 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, s
             if not np.allclose(d['times'], frame_times[d['frame_indices']], rtol=0, atol=1e-6):
                 raise ValueError(f'{speed_path}: speed file frames do not match released timestamps')
             speed, speed_info = filter_flow_speed(d, frame_times, speed_params)
-            if speed_info['speed_fallback'] == 'clip':
-                speed = None  # constant speed, exactly as without --speed
+            if speed_info['speed_fallback'] != 'none':
+                speed = None  # gate or reliability fallback: constant speed, exactly as without --speed
         elif speed_path is not None:
             speed_info = dict(speed_fallback='no speed file')
         positions, info = multi_run_heading_constant_speed(runs, frame_times, sigma_s, speed=speed)
