@@ -784,6 +784,133 @@ def heading_scale(root, clip, pose_dirs, sigma_s=SMOOTH_SIGMA_S):
                 scale_first120=slope120, true_span=float(np.ptp(tt)))
 
 
+def _focal_clip(args):
+    root, clip, base_dirs, new_dirs, diag = args
+    out = dict(key=clip['key'])
+    for tag, dirs in (('f1', base_dirs), ('f2', new_dirs)):
+        data = speed_clip_data(root, clip, None, [d / 'poses' / f"{clip['key']}.npz" for d in dirs])
+        out[f'{tag}_med3_true_speed'] = _score_speed(data, data['med3'], data['tvf'])
+        out[f'{tag}_med3_const'] = _score_speed(data, data['med3'], np.ones(len(data['frame_t'])))
+        out['true_head_const'] = _score_speed(data, data['thf'], np.ones(len(data['frame_t'])))
+    for scale, d in diag.items():
+        pp = d / 'poses' / f"{clip['key']}.npz"
+        if not pp.is_file():
+            continue
+        z = dict(np.load(pp))
+        r = analyse_clip(root, clip, pp)
+        out[f'diag{scale}_head_true_speed'] = r['dpvo_head_true_speed']
+        for k in ('dpvo_residual_px', 'dpvo_weighted_residual_px', 'dpvo_mean_weight'):
+            out[f'diag{scale}_{k}'] = float(z[k]) if k in z else np.nan
+    return out
+
+
+def focal_report(root, clips, base_dirs, new_dirs, diag, workers=8):
+    """Step 1: 3-seed median at the new focal scale vs the base; step 2b: per diag scale, DPVO
+    residual / confidence vs heading quality (true speed + DPVO heading) on the same runs."""
+    from concurrent.futures import ProcessPoolExecutor
+    with ProcessPoolExecutor(workers) as ex:
+        rows = list(ex.map(_focal_clip, [(root, c, base_dirs, new_dirs, diag) for c in clips]))
+    L = ['== step 1: 3-seed median heading, focal x1.0 vs new (drift %)',
+         f"{'clip':<9}{'trueH+const':>12}{'x1 H+trueV':>11}{'new H+trueV':>12}{'x1 H+const':>11}{'new H+const':>12}"]
+    for r in rows:
+        L.append(f"{r['key']:<9}{r['true_head_const']:>12.1f}{r['f1_med3_true_speed']:>11.1f}{r['f2_med3_true_speed']:>12.1f}"
+                 f"{r['f1_med3_const']:>11.1f}{r['f2_med3_const']:>12.1f}")
+    for fn, name in ((np.mean, 'mean'), (np.median, 'median')):
+        L.append(f"{name:<9}{fn([r['true_head_const'] for r in rows]):>12.2f}" + ''.join(
+            f"{fn([r[k] for r in rows]):>{w}.2f}" for k, w in (('f1_med3_true_speed', 11), ('f2_med3_true_speed', 12),
+                                                               ('f1_med3_const', 11), ('f2_med3_const', 12))))
+    if diag:
+        scales = list(diag)
+        L += ['', '== step 2b: per focal scale (seed 0 diag runs): heading quality (DPVO head + true speed, %) / '
+              'DPVO weighted residual (px) / mean confidence',
+              f"{'clip':<9}" + ''.join(f'{"x" + s:>24}' for s in scales) + '   best-heading  lowest-residual  highest-conf']
+        agree_res = agree_conf = 0
+        for r in rows:
+            cells = ''.join(f"{r.get(f'diag{s}_head_true_speed', np.nan):>8.1f}/{r.get(f'diag{s}_dpvo_weighted_residual_px', np.nan):>6.3f}/"
+                            f"{r.get(f'diag{s}_dpvo_mean_weight', np.nan):>7.4f}" for s in scales)
+            bh = min(scales, key=lambda s: r.get(f'diag{s}_head_true_speed', np.inf))
+            br = min(scales, key=lambda s: r.get(f'diag{s}_dpvo_weighted_residual_px', np.inf))
+            bc = max(scales, key=lambda s: r.get(f'diag{s}_dpvo_mean_weight', -np.inf))
+            agree_res += bh == br
+            agree_conf += bh == bc
+            L.append(f"{r['key']:<9}{cells}   x{bh:<12}x{br:<16}x{bc}")
+        L.append(f'lowest residual picks the best-heading scale on {agree_res}/{len(rows)} clips; '
+                 f'highest confidence on {agree_conf}/{len(rows)}')
+    return '\n'.join(L), rows
+
+
+ZOOM_SCALES = ('1.0', '1.5', '2.0', '2.5')
+ZOOM_REPEAT = {'1.0': ['runs/dpvo-fps8-seed0', 'runs/dpvo-fps8-seed1', 'runs/dpvo-fps8-seed2'],
+               '1.5': ['runs/dpvo-fps8-seed0-f1.5'], '2.0': ['runs/dpvo-fps8-seed0-f2', 'runs/dpvo-fps8-seed1-f2',
+                                                         'runs/dpvo-fps8-seed2-f2'], '2.5': ['runs/dpvo-fps8-seed0-f2.5']}
+
+
+def _zoom_clip(args):
+    """Per clip: residual/confidence/heading per diag scale, repeat-run heading quality per scale
+    (same setting, other runs), turning, rocking, scene and texture features, DPVO failures."""
+    import cv2
+    import flow_speed as fs
+    root, clip = args
+    k = clip['key']
+    out = dict(key=k)
+    for sc in ZOOM_SCALES:
+        pp = REPO_ROOT / f'runs/diag-f{sc}/poses/{k}.npz'
+        z = dict(np.load(pp))
+        out[f'res_{sc}'] = float(z['dpvo_weighted_residual_px'])
+        out[f'conf_{sc}'] = float(z['dpvo_mean_weight'])
+        out[f'head_{sc}'] = analyse_clip(root, clip, pp)['dpvo_head_true_speed']
+        out[f'finite_{sc}'] = float(np.isfinite(z['poses']).all(1).mean())
+        reps = [analyse_clip(root, clip, REPO_ROOT / d / 'poses' / f'{k}.npz')['dpvo_head_true_speed'] for d in ZOOM_REPEAT[sc]]
+        out[f'head_rep_{sc}'] = reps                     # other runs of the same scale (repeatability)
+    # true turning
+    ref_t, ref_xyz = load_reference(root, clip)
+    th, _ = true_motion(ref_t, ref_xyz)
+    mid = 0.5 * (ref_t[1:] + ref_t[:-1])
+    g, ths = smooth_in_time(mid, th, SMOOTH_SIGMA_S)
+    turn = float(np.degrees(np.abs(np.diff(ths)).sum()))
+    out.update(turn_total_deg=turn, turn_per_min=turn / ((g[-1] - g[0]) / 60), true_span_deg=float(np.degrees(np.ptp(ths))))
+    # rocking: pitch/roll of the camera about DPVO's up at x2.0 (closest to the true focal), 5 s high-pass
+    z = load_pose_npz(REPO_ROOT / f'runs/dpvo-fps8-seed0-f2/poses/{k}.npz')
+    ok = np.isfinite(z['poses']).all(1)
+    R = quat_to_rotmat(z['poses'][ok, 3:7])
+    U = estimate_up(R)
+    up_c = np.einsum('nji,j->ni', R, U)                   # up in camera coords
+    pitch = np.degrees(np.arctan2(-up_c[:, 2], -up_c[:, 1]))
+    roll = np.degrees(np.arctan2(up_c[:, 0], -up_c[:, 1]))
+    t = z['times'][ok]
+    out['rock_pitch_std_deg'] = float(np.std(pitch - rolling_median(t, pitch, 5.0)))
+    out['rock_roll_std_deg'] = float(np.std(roll - rolling_median(t, roll, 5.0)))
+    # scene: water area below the fitted horizon (DPVO picks patch centres uniformly at random,
+    # so this is also the expected fraction of patches on water) and texture near the image edges
+    d = dict(np.load(REPO_ROOT / f'runs/flow-v2/speed/{k}.npz'))
+    frames, dec, times, K = fs.clip_frames(root, clip, 8.0)
+    zr = load_pose_npz(REPO_ROOT / f'runs/dpvo-fps8-seed0/poses/{k}.npz')
+    Rr = quat_to_rotmat(np.where(np.isfinite(zr['poses'][:, 3:7]), zr['poses'][:, 3:7], [0, 0, 0, 1]))
+    Ur = estimate_up(Rr[np.isfinite(zr['poses']).all(1)])
+    H, W = frames[0].shape
+    xs = np.arange(W, dtype=float)
+    yy = np.arange(H)[:, None]
+    wf, edge_out, edge_all, tex_above = [], [], [], []
+    for i in np.linspace(0, len(frames) - 1, 24).astype(int):
+        u = fs.correction(d['horizon_pitch_deg'][i], d['horizon_roll_deg'][i]) @ (Rr[i].T @ Ur)
+        hy = fs.horizon_rows(u / np.linalg.norm(u), K, xs)
+        below = yy > np.nan_to_num(hy, nan=0)[None, :]
+        wf.append(below.mean())
+        gm = np.hypot(cv2.Sobel(frames[i], cv2.CV_32F, 1, 0), cv2.Sobel(frames[i], cv2.CV_32F, 0, 1))
+        edge_all.append(gm.mean())
+        edge_out.append(np.concatenate([gm[:, :W // 7], gm[:, -W // 7:]], 1).mean())
+        tex_above.append(gm[~below].sum() / max(gm.sum(), 1e-9))
+    out.update(water_frac=float(np.mean(wf)), edge_texture_ratio=float(np.mean(edge_out) / np.mean(edge_all)),
+               texture_share_above_horizon=float(np.mean(tex_above)), mean_gradient=float(np.mean(edge_all)))
+    return out
+
+
+def zoom_analysis(root, clips, workers=8):
+    from concurrent.futures import ProcessPoolExecutor
+    with ProcessPoolExecutor(workers) as ex:
+        return list(ex.map(_zoom_clip, [(root, c) for c in clips]))
+
+
 def _failure_job(args):
     return flow_failure_diag(*args)
 
@@ -838,6 +965,10 @@ def main(argv=None):
     ap.add_argument('--speed-params', type=Path, help='speed filter thresholds JSON (from --speed-tune)')
     ap.add_argument('--heading-poses', type=Path, nargs='+', help='run_dpvo.py dirs for the median heading (e.g. 3 seeds)')
     ap.add_argument('--workers', type=int, default=8)
+    ap.add_argument('--zoom-analysis', action='store_true', help='flir-VIS focal: why the residual detector works or not')
+    ap.add_argument('--focal-base', type=Path, nargs='+', help='focal report: base run dirs (e.g. 3 seeds at x1.0)')
+    ap.add_argument('--focal-new', type=Path, nargs='+', help='focal report: run dirs at the new focal scale')
+    ap.add_argument('--focal-diag', nargs='*', default=[], help='focal report: SCALE=DIR diag runs (run_dpvo --dpvo-diag)')
     ap.add_argument('--worst', type=int, default=0,
                     help='also list the N worst clips, classify speed/heading/DPVO failure (needs --heading-diff)')
     args = ap.parse_args(argv)
@@ -850,6 +981,20 @@ def main(argv=None):
     if any(c['reference'] is None for c in selected):
         ap.error('oracle needs references; test clips have none')
     root = args.dataset.resolve().parent
+    if args.zoom_analysis:
+        rows = zoom_analysis(root, selected, args.workers)
+        args.output.mkdir(parents=True, exist_ok=True)
+        write_json(args.output / 'zoom_analysis.json', rows)
+        print('written', args.output / 'zoom_analysis.json')
+        return 0
+    if args.focal_base:
+        diag = {kv.split('=', 1)[0]: Path(kv.split('=', 1)[1]) for kv in args.focal_diag}
+        text, rows = focal_report(root, selected, args.focal_base, args.focal_new, diag, args.workers)
+        args.output.mkdir(parents=True, exist_ok=True)
+        write_csv(args.output / 'focal_report.csv', rows)
+        (args.output / 'focal_report.txt').write_text(text + '\n')
+        print(text)
+        return 0
     if args.speed_tune:
         train = [c for c in selected if c['split'] == 'train']
         if len(train) != len(selected):

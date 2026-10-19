@@ -179,12 +179,16 @@ def fit_translation(p, flow, rays, s, R_ji, e1, e2, K, iters=6):
 # --------------------------------------------------------------------------------------
 # Per clip
 # --------------------------------------------------------------------------------------
-def clip_frames(root, clip, target_fps):
-    """Gray frames, decoded indices, times and intrinsics exactly as DPVO saw them."""
+def clip_frames(root, clip, target_fps, focal_scale=1.0):
+    """Gray frames, decoded indices, times and intrinsics exactly as DPVO saw them (with the same
+    focal_scale on the released fx, fy as run_dpvo.py --focal-scale)."""
     from preprocessing import ClipPreprocessor  # starter
     frame_times = load_timestamps(root, clip)
+    calibration = dict(clip['calibration'])
+    if focal_scale != 1.0:
+        calibration.update(fx=calibration['fx'] * focal_scale, fy=calibration['fy'] * focal_scale)
     pre = ClipPreprocessor(str(asset_path(root, clip['video'])), clip['camera_mode'], target_fps,
-                           calibration=clip['calibration'], frame_timestamps=frame_times)
+                           calibration=calibration, frame_timestamps=frame_times)
     frames, dec, times, K = [], [], [], None
     for _, img, intr, pts, d in pre.frames_with_time():
         frames.append(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
@@ -204,10 +208,10 @@ def best_pose_run(pose_paths):
     return z, path
 
 
-def process_clip(root, clip, pose_paths, out_path, target_fps=8.0):
+def process_clip(root, clip, pose_paths, out_path, target_fps=8.0, focal_scale=1.0):
     """Flow + water-plane speed for one clip. Returns a summary dict."""
     t0 = time.time()
-    frames, dec, times, K = clip_frames(root, clip, target_fps)
+    frames, dec, times, K = clip_frames(root, clip, target_fps, focal_scale)
     t_dec = time.time() - t0
     z, pose_used = best_pose_run(pose_paths)
     if not np.array_equal(z['frame_indices'], dec):
@@ -269,8 +273,9 @@ def process_clip(root, clip, pose_paths, out_path, target_fps=8.0):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(out_path, t_mid=t_mid, dt=dt, times=times, frame_indices=dec, **out, **speeds,
              horizon_pitch_deg=hp, horizon_roll_deg=hr, horizon_windows=htable,
-             static_frac=float(static.mean()), K=np.array(K))
+             static_frac=float(static.mean()), K=np.array(K), focal_scale=np.float64(focal_scale))
     return dict(key=clip['key'], camera_mode=clip['camera_mode'], n_pairs=n - 1, poses=pose_used,
+                focal_scale=focal_scale,
                 valid_frac=float(np.isfinite(speeds['speed_all']).mean()),
                 horizon_pitch_deg=[round(float(np.min(hp)), 2), round(float(np.max(hp)), 2)],
                 horizon_roll_deg=[round(float(np.min(hr)), 2), round(float(np.max(hr)), 2)],
@@ -281,7 +286,7 @@ def process_clip(root, clip, pose_paths, out_path, target_fps=8.0):
 def render_frames(root, clip, d, pose_dirs, times_s, labels, out_png, width=640):
     """Frames at times_s with the fitted horizon (red) and the water sample points (green).
     Never reads references (labels are supplied by the caller)."""
-    frames, dec, times, K = clip_frames(root, clip, 8.0)
+    frames, dec, times, K = clip_frames(root, clip, 8.0, float(d.get('focal_scale', 1.0)))
     z, _ = best_pose_run([pd / 'poses' / f"{clip['key']}.npz" for pd in pose_dirs])
     R = quat_to_rotmat(np.where(np.isfinite(z['poses'][:, 3:7]), z['poses'][:, 3:7], [0, 0, 0, 1]))
     U = estimate_up(R[np.isfinite(z['poses']).all(1)])
@@ -318,9 +323,9 @@ def _render_job(args):
 
 
 def _job(args):
-    root, clip, pose_paths, out_path = args
+    root, clip, pose_paths, out_path, focal_scale = args
     try:
-        return process_clip(root, clip, pose_paths, out_path)
+        return process_clip(root, clip, pose_paths, out_path, focal_scale=focal_scale)
     except Exception as exc:
         return dict(key=clip['key'], camera_mode=clip['camera_mode'], error=str(exc)[:300])
 
@@ -336,6 +341,8 @@ def main(argv=None):
     ap.add_argument('--output', required=True, type=Path)
     ap.add_argument('--workers', type=int, default=6)
     ap.add_argument('--overwrite', action='store_true')
+    ap.add_argument('--focal-scale', type=float, default=1.0,
+                    help='multiply the released fx, fy (must match the run_dpvo.py --focal-scale of --poses)')
     ap.add_argument('--render', action='store_true',
                     help='only render a geometry check (3 frames with horizon/water) per processed clip')
     args = ap.parse_args(argv)
@@ -358,7 +365,7 @@ def main(argv=None):
         out = args.output / 'speed' / f"{c['key']}.npz"
         if out.is_file() and not args.overwrite:
             continue
-        jobs.append((root, c, [d / 'poses' / f"{c['key']}.npz" for d in args.poses], out))
+        jobs.append((root, c, [d / 'poses' / f"{c['key']}.npz" for d in args.poses], out, args.focal_scale))
     print(f'{len(jobs)} clips to process ({len(clips) - len(jobs)} already done)', flush=True)
     summary_path = args.output / 'flow_speed_summary.json'
     summary = {}

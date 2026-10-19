@@ -30,6 +30,36 @@ from common import (DEFAULT_DATASET, asset_path, load_manifest, load_timestamps,
                     validate_prediction, write_json)
 
 
+DIAG = dict(res_sum=0.0, w_sum=0.0, wres_sum=0.0, n=0)
+
+
+def install_dpvo_diagnostics():
+    """Wrap DPVO.update (pinned DPVO, unchanged on disk) to accumulate, after each update's bundle
+    adjustment, the confidence-weighted reprojection residual of the patch centres (px) and the
+    mean confidence weight. Used to compare focal lengths without ground truth."""
+    import tracking
+    tracking._dpvo_config()                      # puts DPVO_DIR on sys.path
+    from dpvo.dpvo import DPVO
+    if getattr(DPVO.update, '_fermarble_diag', False):
+        return
+    original = DPVO.update
+
+    def update(self):
+        original(self)
+        coords = self.reproject()
+        centre = coords[..., self.P // 2, self.P // 2]
+        res = (centre - self.pg.target).norm(dim=-1)            # [1, edges]
+        w = self.pg.weight.mean(dim=-1)                          # [1, edges]
+        ok = torch.isfinite(res) & torch.isfinite(w)
+        if ok.any():
+            DIAG['res_sum'] += float(res[ok].mean())
+            DIAG['w_sum'] += float(w[ok].mean())
+            DIAG['wres_sum'] += float((res[ok] * w[ok]).sum() / w[ok].sum().clamp(min=1e-9))
+            DIAG['n'] += 1
+    update._fermarble_diag = True
+    DPVO.update = update
+
+
 def save_npz_atomic(path: Path, **arrays):
     tmp = path.with_name(f'.{path.name}.tmp')
     with open(tmp, 'wb') as fh:
@@ -49,6 +79,8 @@ def main(argv=None):
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--dpvo-buffer-size', type=int)
     ap.add_argument('--retry-failed', action='store_true', help='rerun clips recorded as failed')
+    ap.add_argument('--dpvo-diag', action='store_true',
+                    help='record DPVO mean reprojection residual and confidence per clip (focal-length checks)')
     ap.add_argument('--focal-scale', type=float, default=1.0,
                     help='experiment: multiply the released fx, fy by this (e.g. a zoomed camera)')
     ap.add_argument('--clahe', action='store_true',
@@ -59,6 +91,8 @@ def main(argv=None):
     if args.clahe:
         import thermal
         thermal.install()  # track() now decodes through thermal.clahe_stream_worker
+    if args.dpvo_diag:
+        install_dpvo_diagnostics()
     if torch is not None:
         # The starter wraps DPVO's frame loop in torch.no_grad() but calls slam.terminate() after
         # it; terminate() runs 12 update() calls with autograd on, whose graph can exceed 14 GiB
@@ -106,6 +140,7 @@ def main(argv=None):
         if torch is not None and torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
         started = time.perf_counter()
+        DIAG.update(res_sum=0.0, w_sum=0.0, wres_sum=0.0, n=0)
         print(f'{tag}: tracking ({clip["camera_mode"]})', flush=True)
         try:
             frame_times = load_timestamps(root, clip)
@@ -124,6 +159,12 @@ def main(argv=None):
             if not np.allclose(times, frame_times[frame_idx], rtol=0, atol=1e-6):
                 raise RuntimeError('tracker times disagree with released frame timestamps')
             n_finite = int(np.isfinite(poses).all(1).sum())
+            diag = {}
+            if args.dpvo_diag and DIAG['n']:
+                diag = dict(dpvo_residual_px=np.float64(DIAG['res_sum'] / DIAG['n']),
+                            dpvo_weighted_residual_px=np.float64(DIAG['wres_sum'] / DIAG['n']),
+                            dpvo_mean_weight=np.float64(DIAG['w_sum'] / DIAG['n']), dpvo_updates=np.int64(DIAG['n']))
+                record.update({k: float(v) for k, v in diag.items()})
             # Raw DPVO baseline, exactly as starter infer.py would write it.
             raw = dict(key=key, frame_indices=frame_idx.tolist(), times=times.tolist(),
                        positions=poses[:, :3].tolist())
@@ -137,7 +178,7 @@ def main(argv=None):
                             frame_indices=frame_idx, times=times,
                             n_frames=np.int64(len(frame_times)), native_fps=np.float64(pre.native_fps),
                             stride=np.int64(pre.stride), seed=np.int64(args.seed),
-                            target_fps=np.float64(args.target_fps))
+                            target_fps=np.float64(args.target_fps), **diag)
             record.update(status='tracked', n_poses=len(poses), n_finite_poses=n_finite,
                           raw_prediction=raw_status, native_fps=pre.native_fps, stride=pre.stride)
         except KeyboardInterrupt:
