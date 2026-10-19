@@ -55,3 +55,32 @@ readability only, not scores.
 pose mirrors the heading, and a 3-D Sim(3) undoes a mirror of a planar path. The oracle therefore
 reports `fwd_cos`: the median cosine between DPVO's translation direction and camera +z. It is
 about +1 for the right convention.
+
+## flir-VIS focal length (decision: x2.0, with x1.0 fallback)
+
+- **Finding.** On flir-VIS, DPVO over-turns (clip_075: 2.0x the true heading change in all seeds).
+  Re-running DPVO with the released fx, fy multiplied by 2 (`run_dpvo.py --focal-scale 2.0`)
+  fixes it. 8 flir-VIS clips, all train (no val clips exist):
+  - focal sweep x1.0 / 1.5 / 2.0 / 2.5 (seed 0): x2.0 best overall;
+  - 3-seed median confirmation, mean drift of DPVO heading + constant speed: 17.15 -> 7.74 %
+    (heading + true speed 12.21 -> 3.75 %); 6 clips better, 001 and 090 worse.
+  Report: `runs/focal-report/focal_report.txt`.
+- **No ground-truth-free per-clip detector works** (each tested on the 8 train clips):
+  1. calibration, resolution, crop, encoding, overlays or the visible bow: nothing separates 001/090;
+  2. DPVO mean reprojection residual (`--dpvo-diag`): repeatable across seeds (SD ~0.09 px) but
+     picks the better of x1.0/x2.0 on 5/8; consistently wrong on the two clips with the burned-in
+     HUD gauge (075, 082);
+  3. near/far flow-band agreement at x1.0 vs x2.0: 4/8 (chance);
+  4. GeoCalib single-image calibration: 2/8, systematically opposite (075/082 ~60 deg = nominal,
+     001/090 ~40 deg). Results: `runs/focal-report/zoom_analysis.json`, `runs/geocalib/geocalib.csv`.
+- **Pipeline verified.** Decoded size = manifest container (1920x1080); the starter's crop,
+  half-resolution and multiple-of-16 trim scale fx, fy, cx, cy consistently; DPVO's implied HFOV equals
+  the nominal one (63.7 deg flir-VIS). Only quirk: flir-VIS fy is 8 % larger than fx (starter config).
+  No factor-2 error anywhere.
+- **Cause unresolved.** Not a pipeline bug, not camera pan (the HUD gauge shows the camera fixed
+  forward), and GeoCalib does not support optical zoom on 075/082. The x2.0 choice rests on the
+  train heading results only.
+- **Test bundles.** `runs/submission_test_flow_focal.json`: x2.0 on all 11 flir-VIS test clips.
+  `runs/submission_test_flow_focal_v2.json` (`fermarble/jobs/build_focal_v2.py`): same, plus a
+  ground-truth-free fallback to x1.0 when every x2.0 seed of a clip has NaN poses and an x1.0 seed is
+  intact (clip_096, clip_104).
