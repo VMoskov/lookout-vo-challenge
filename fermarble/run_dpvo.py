@@ -79,6 +79,9 @@ def main(argv=None):
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--dpvo-buffer-size', type=int)
     ap.add_argument('--retry-failed', action='store_true', help='rerun clips recorded as failed')
+    ap.add_argument('--patch-strategy', choices=['RANDOM', 'GRADIENT_BIAS'], default='RANDOM',
+                    help="DPVO's patch centre selection (pinned DPVO option CENTROID_SEL_STRAT); "
+                         'GRADIENT_BIAS keeps the most textured third of 3x random candidates')
     ap.add_argument('--dpvo-diag', action='store_true',
                     help='record DPVO mean reprojection residual and confidence per clip (focal-length checks)')
     ap.add_argument('--focal-scale', type=float, default=1.0,
@@ -93,6 +96,15 @@ def main(argv=None):
         thermal.install()  # track() now decodes through thermal.clahe_stream_worker
     if args.dpvo_diag:
         install_dpvo_diagnostics()
+    if args.patch_strategy != 'RANDOM':
+        import tracking
+        base_config = tracking._dpvo_config
+
+        def _config(dpvo_buffer_size=None):     # track() reads its DPVO config through this
+            cfg = base_config(dpvo_buffer_size)
+            cfg.CENTROID_SEL_STRAT = args.patch_strategy
+            return cfg
+        tracking._dpvo_config = _config
     if torch is not None:
         # The starter wraps DPVO's frame loop in torch.no_grad() but calls slam.terminate() after
         # it; terminate() runs 12 update() calls with autograd on, whose graph can exceed 14 GiB
@@ -111,6 +123,8 @@ def main(argv=None):
     manifest_path = args.output / 'run_manifest.json'
     run = read_json(manifest_path) if manifest_path.is_file() else dict(clips={})
     settings = dict(target_fps=args.target_fps, seed=args.seed, dpvo_buffer_size=args.dpvo_buffer_size)
+    if args.patch_strategy != 'RANDOM':  # key only when used, so older runs still resume
+        settings['patch_strategy'] = args.patch_strategy
     if args.focal_scale != 1.0:  # key only when used, so older runs still resume
         settings['focal_scale'] = args.focal_scale
     if args.clahe:  # key only when on, so runs started before this option still resume

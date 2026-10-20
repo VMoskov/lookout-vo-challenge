@@ -911,6 +911,91 @@ def zoom_analysis(root, clips, workers=8):
         return list(ex.map(_zoom_clip, [(root, c) for c in clips]))
 
 
+def path_compare(root, clip, variants, out_png):
+    """True path vs median-heading paths of several DPVO run sets (label -> run dirs), each
+    integrated with constant speed (left) and with the true speed (right) and Sim(3)-aligned to the
+    reference exactly as the evaluator does. Returns {label: (drift const, drift true speed)}."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(1, 2, figsize=(13, 6.5))
+    out = {}
+    ref_drawn = False
+    for (label, dirs), col in zip(variants.items(), ('tab:blue', 'tab:red', 'tab:green')):
+        data = speed_clip_data(root, clip, None, [d / 'poses' / f"{clip['key']}.npz" for d in dirs])
+        res = []
+        for a, speed, name in ((ax[0], np.ones(len(data['frame_t'])), 'constant speed'), (ax[1], data['tvf'], 'true speed')):
+            xyz = integrate_planar(data['frame_t'], data['med3'], speed)
+            vo = metrics.score_trajectory(data['frame_t'], xyz, data['ref_t'], data['ref_xyz'])
+            if not ref_drawn:
+                a.plot(*vo['reference'].T, 'k', lw=2.2, label='true path')
+                a.plot(*vo['reference'][0], 'ko')
+            a.plot(*vo['aligned'].T, color=col, lw=1.3, label=f"{label} heading: drift {vo['drift_pct']:.1f} %")
+            a.set_title(f"{clip['key']} ({clip['split']}, {clip['camera_mode']}): median heading + {name}, Sim(3)-aligned", fontsize=9)
+            res.append(float(vo['drift_pct']))
+        ref_drawn = True
+        out[label] = tuple(res)
+    for a in ax:
+        a.set_aspect('equal')
+        a.set_xlabel('east (m)')
+        a.set_ylabel('north (m)')
+        a.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=100)
+    plt.close(fig)
+    return out
+
+
+def _compare_clip(args):
+    root, clip, runs, params = args
+    row = dict(key=clip['key'], split=clip['split'], camera_mode=clip['camera_mode'])
+    for label, (pose_dir, speed_dir) in runs.items():
+        pp = Path(pose_dir) / 'poses' / f"{clip['key']}.npz"
+        sp = Path(speed_dir) / 'speed' / f"{clip['key']}.npz" if speed_dir else None
+        if not pp.is_file():
+            row[f'{label}_head'] = row[f'{label}_pipe'] = np.nan
+            continue
+        data = speed_clip_data(root, clip, sp, [pp])
+        row[f'{label}_head'] = _score_speed(data, data['med3'], data['tvf'])
+        speed = np.ones(len(data['frame_t']))
+        if data['d'] is not None:
+            fs_, info = filter_flow_speed(data['d'], data['frame_t'], params)
+            speed = fs_ if info['speed_fallback'] == 'none' else speed
+        row[f'{label}_pipe'] = _score_speed(data, data['med3'], speed)
+        z = load_pose_npz(pp)
+        row[f'{label}_nan'] = bool(not np.isfinite(z['poses']).all())
+    return row
+
+
+def compare_runs_heading(root, clips, runs, params, workers=8):
+    """Single DPVO runs side by side (label -> (pose dir, flow speed dir or None)): heading only
+    (run heading + true speed) and pipeline (run heading + filtered flow speed, else constant)."""
+    from concurrent.futures import ProcessPoolExecutor
+    with ProcessPoolExecutor(workers) as ex:
+        rows = list(ex.map(_compare_clip, [(root, c, runs, params) for c in clips]))
+    labels = list(runs)
+    base = labels[0]
+    L = []
+    for metric, name in (('head', 'heading only (run heading + true speed)'), ('pipe', 'pipeline (run heading + flow v3a)')):
+        L.append(f'== {name}, drift %')
+        L.append(f"{'group':<14}{'n':>4}" + ''.join(f'{l + " mean/med":>24}' for l in labels) + '   better/worse vs ' + base)
+        groups = [('all', rows)] + [(sp, [r for r in rows if r['split'] == sp]) for sp in ('train', 'val')]
+        for gname, g in groups:
+            if not g:
+                continue
+            cells = ''.join(f"{np.nanmean([r[f'{l}_{metric}'] for r in g]):>12.2f}/{np.nanmedian([r[f'{l}_{metric}'] for r in g]):<11.2f}" for l in labels)
+            bw = '  '.join(f"{l}: {sum(r[f'{l}_{metric}'] < r[f'{base}_{metric}'] - .5 for r in g)}/{sum(r[f'{l}_{metric}'] > r[f'{base}_{metric}'] + .5 for r in g)}"
+                           for l in labels[1:])
+            L.append(f'{gname:<14}{len(g):>4}' + cells + '   ' + bw)
+    L.append('')
+    L.append(f"{'clip':<9}{'split':<6}" + ''.join(f'{l + " head/pipe":>22}' for l in labels))
+    for r in rows:
+        L.append(f"{r['key']:<9}{r['split']:<6}" + ''.join(
+            f"{r[f'{l}_head']:>10.1f}/{r[f'{l}_pipe']:<6.1f}{'*' if r.get(f'{l}_nan') else ' ':<5}" for l in labels))
+    L.append('(* = run with NaN poses)')
+    return '\n'.join(L), rows
+
+
 def _failure_job(args):
     return flow_failure_diag(*args)
 
@@ -965,6 +1050,7 @@ def main(argv=None):
     ap.add_argument('--speed-params', type=Path, help='speed filter thresholds JSON (from --speed-tune)')
     ap.add_argument('--heading-poses', type=Path, nargs='+', help='run_dpvo.py dirs for the median heading (e.g. 3 seeds)')
     ap.add_argument('--workers', type=int, default=8)
+    ap.add_argument('--compare-runs', nargs='+', help='LABEL=POSEDIR[:SPEEDDIR] single DPVO runs to compare (first = base)')
     ap.add_argument('--zoom-analysis', action='store_true', help='flir-VIS focal: why the residual detector works or not')
     ap.add_argument('--focal-base', type=Path, nargs='+', help='focal report: base run dirs (e.g. 3 seeds at x1.0)')
     ap.add_argument('--focal-new', type=Path, nargs='+', help='focal report: run dirs at the new focal scale')
@@ -981,6 +1067,19 @@ def main(argv=None):
     if any(c['reference'] is None for c in selected):
         ap.error('oracle needs references; test clips have none')
     root = args.dataset.resolve().parent
+    if args.compare_runs:
+        runs = {}
+        for spec in args.compare_runs:
+            label, rest = spec.split('=', 1)
+            pose, _, speed = rest.partition(':')
+            runs[label] = (REPO_ROOT / pose, (REPO_ROOT / speed) if speed else None)
+        params = read_json(args.speed_params) if args.speed_params else None
+        text, rows = compare_runs_heading(root, selected, runs, params, args.workers)
+        args.output.mkdir(parents=True, exist_ok=True)
+        write_csv(args.output / 'compare_runs.csv', rows)
+        (args.output / 'compare_runs.txt').write_text(text + '\n')
+        print(text)
+        return 0
     if args.zoom_analysis:
         rows = zoom_analysis(root, selected, args.workers)
         args.output.mkdir(parents=True, exist_ok=True)
