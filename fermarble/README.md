@@ -56,7 +56,13 @@ pose mirrors the heading, and a 3-D Sim(3) undoes a mirror of a planar path. The
 reports `fwd_cos`: the median cosine between DPVO's translation direction and camera +z. It is
 about +1 for the right convention.
 
-## flir-VIS focal length (decision: x2.0, with x1.0 fallback)
+## flir-VIS focal length (x2.0 for all clips REJECTED on test)
+
+> **Test result (leaderboard):** `submission_test_flow_focal_v2.json` (x2.0 on all flir-VIS, x1.0
+> fallback) scored **18.99 %**, worse than `submission_test_flow.json` (x1.0 med3 + flow, **17.94 %**,
+> #18758). A single x2.0 for every flir-VIS clip hurts on test, so **the baseline is the x1.0 bundle
+> `runs/submission_test_flow.json`**. The leaderboard suggests the true focal length differs per clip
+> by varying factors (zoom); the dev findings below explain why one global factor fits train but not test.
 
 - **Finding.** On flir-VIS, DPVO over-turns (clip_075: 2.0x the true heading change in all seeds).
   Re-running DPVO with the released fx, fy multiplied by 2 (`run_dpvo.py --focal-scale 2.0`)
@@ -80,7 +86,16 @@ about +1 for the right convention.
 - **Cause unresolved.** Not a pipeline bug, not camera pan (the HUD gauge shows the camera fixed
   forward), and GeoCalib does not support optical zoom on 075/082. The x2.0 choice rests on the
   train heading results only.
-- **Test bundles.** `runs/submission_test_flow_focal.json`: x2.0 on all 11 flir-VIS test clips.
+- **Test bundles (not the baseline, see the test result above).** `runs/submission_test_flow_focal.json`: x2.0 on all 11 flir-VIS test clips.
   `runs/submission_test_flow_focal_v2.json` (`fermarble/jobs/build_focal_v2.py`): same, plus a
   ground-truth-free fallback to x1.0 when every x2.0 seed of a clip has NaN poses and an x1.0 seed is
   intact (clip_096, clip_104).
+
+## Rejected options (dev evaluation)
+
+- `run_dpvo.py --patch-strategy GRADIENT_BIAS` (DPVO's textured-patch sampling): on the 67 wide clips within
+  seed noise (heading-only mean 9.25 -> 9.43 %, median 4.68 -> 3.62 %) with a few large failures
+  (clip_017 12 -> 73 %); worse on flir-VIS and no effect on the 2x over-turning. Not used.
+- flir-IR focal x0.5 / x0.75: the low average turn ratio is tracking failure on 3 of 5 clips, not
+  calibration; x1.0 is best on train. flir-IR stays x1.0. Reports: `runs/gb-wide/`, `runs/gb-flirvis/`,
+  `runs/flirir-focal/`.

@@ -949,21 +949,21 @@ def path_compare(root, clip, variants, out_png):
 def _compare_clip(args):
     root, clip, runs, params = args
     row = dict(key=clip['key'], split=clip['split'], camera_mode=clip['camera_mode'])
-    for label, (pose_dir, speed_dir) in runs.items():
-        pp = Path(pose_dir) / 'poses' / f"{clip['key']}.npz"
+    for label, (pose_dirs, speed_dir) in runs.items():
+        pps = [Path(d) / 'poses' / f"{clip['key']}.npz" for d in pose_dirs]
+        pps = [pp for pp in pps if pp.is_file()]
         sp = Path(speed_dir) / 'speed' / f"{clip['key']}.npz" if speed_dir else None
-        if not pp.is_file():
+        if not pps:
             row[f'{label}_head'] = row[f'{label}_pipe'] = np.nan
             continue
-        data = speed_clip_data(root, clip, sp, [pp])
+        data = speed_clip_data(root, clip, sp, pps)
         row[f'{label}_head'] = _score_speed(data, data['med3'], data['tvf'])
         speed = np.ones(len(data['frame_t']))
         if data['d'] is not None:
             fs_, info = filter_flow_speed(data['d'], data['frame_t'], params)
             speed = fs_ if info['speed_fallback'] == 'none' else speed
         row[f'{label}_pipe'] = _score_speed(data, data['med3'], speed)
-        z = load_pose_npz(pp)
-        row[f'{label}_nan'] = bool(not np.isfinite(z['poses']).all())
+        row[f'{label}_nan'] = any(not np.isfinite(load_pose_npz(pp)['poses']).all() for pp in pps)
     return row
 
 
@@ -993,6 +993,95 @@ def compare_runs_heading(root, clips, runs, params, workers=8):
         L.append(f"{r['key']:<9}{r['split']:<6}" + ''.join(
             f"{r[f'{l}_head']:>10.1f}/{r[f'{l}_pipe']:<6.1f}{'*' if r.get(f'{l}_nan') else ' ':<5}" for l in labels))
     L.append('(* = run with NaN poses)')
+    return '\n'.join(L), rows
+
+
+def _combo_clip(args):
+    """One wide clip: DPVO seeds, their median, VGGT, and the 4-member median; GT-free disagreement
+    features; heading-only and pipeline (flow v3a) scores per heading source."""
+    from common import _run_heading, circular_median
+    root, clip, dpvo_dirs, vggt_dir, speed_dir, params = args
+    k = clip['key']
+    data = speed_clip_data(root, clip, speed_dir / 'speed' / f'{k}.npz', [d / 'poses' / f'{k}.npz' for d in dpvo_dirs])
+    t = data['frame_t']
+    seeds = []
+    for d in dpvo_dirs:
+        z = load_pose_npz(d / 'poses' / f'{k}.npz')
+        h, _ = _run_heading(z['poses'], z['times'], t, SMOOTH_SIGMA_S)
+        if h is not None:
+            seeds.append(h)
+    zv = load_pose_npz(vggt_dir / 'poses' / f'{k}.npz')
+    hv, _ = _run_heading(zv['poses'], zv['times'], t, SMOOTH_SIGMA_S)
+    med3 = data['med3']
+    speed = np.ones(len(t))
+    if data['d'] is not None:
+        fs_, info = filter_flow_speed(data['d'], t, params)
+        speed = fs_ if info['speed_fallback'] == 'none' else speed
+    row = dict(key=k, split=clip['split'])
+    heads = dict(med3=med3, vggt=hv, med4=circular_median(seeds + [hv]) if hv is not None else med3)
+    for name, h in heads.items():
+        row[f'{name}_head'] = _score_speed(data, h, data['tvf'])
+        row[f'{name}_pipe'] = _score_speed(data, h, speed)
+    wrap = lambda x: np.degrees(np.angle(np.exp(1j * x)))
+    row['seed_mad_deg'] = float(np.median([np.median(np.abs(wrap(h - med3))) for h in seeds])) if seeds else np.nan
+    row['seed_max_deg'] = float(max(np.percentile(np.abs(wrap(h - med3)), 95) for h in seeds)) if seeds else np.nan
+    if hv is not None:
+        dd = wrap(med3 - hv)
+        dd = dd - np.median(dd)
+        row['dv_p95_deg'] = float(np.percentile(np.abs(dd), 95))
+        j = np.searchsorted(t, t + 60.0)
+        ok = j < len(t)
+        row['dv_win60_deg'] = float(np.abs(dd[j[ok]] - dd[ok]).max()) if ok.any() else np.nan
+    return row
+
+
+COMBO_FEATURES = ('seed_mad_deg', 'seed_max_deg', 'dv_p95_deg', 'dv_win60_deg')
+
+
+def combo_eval(root, clips, dpvo_dirs, vggt_dir, speed_dir, params, workers=8):
+    """VGGT/DPVO heading combinations on wide train+val: fixed variants and a per-clip switch
+    (VGGT if a GT-free feature exceeds a threshold) fitted on TRAIN."""
+    from concurrent.futures import ProcessPoolExecutor
+    with ProcessPoolExecutor(workers) as ex:
+        rows = list(ex.map(_combo_clip, [(root, c, dpvo_dirs, vggt_dir, speed_dir, params) for c in clips]))
+    tr = [r for r in rows if r['split'] == 'train']
+    fits = []
+    for feat in COMBO_FEATURES:
+        vals = sorted({round(r[feat], 2) for r in tr if np.isfinite(r[feat])})
+        for thr in vals + [np.inf]:
+            for metric in ('head', 'pipe'):
+                pick = lambda r: r[f'vggt_{metric}'] if r[feat] > thr else r[f'med3_{metric}']
+                fits.append(dict(feature=feat, threshold=thr, metric=metric, train_mean=float(np.mean([pick(r) for r in tr]))))
+    best = {m: min([f for f in fits if f['metric'] == m], key=lambda f: f['train_mean']) for m in ('head', 'pipe')}
+    for r in rows:
+        for m, f in best.items():
+            r[f'switch_{m}'] = r[f'vggt_{m}'] if r[f['feature']] > f['threshold'] else r[f'med3_{m}']
+            r[f'switch_{m}_uses_vggt'] = bool(r[f['feature']] > f['threshold'])
+    L = []
+    for m, name in (('head', 'heading only (heading + true speed)'), ('pipe', 'full pipeline (heading + flow v3a)')):
+        f = best[m]
+        L.append(f"== {name}; switch fitted on train: VGGT if {f['feature']} > {f['threshold']} "
+                 f"(train mean {f['train_mean']:.2f})")
+        L.append(f"{'group':<8}{'n':>4}" + ''.join(f'{v + " mean/med":>20}' for v in ('med3', 'vggt', 'med4', 'switch'))
+                 + f"{'switch uses VGGT':>18}")
+        for gname, g in (('train', tr), ('val', [r for r in rows if r['split'] == 'val']), ('all', rows)):
+            if not g:
+                continue
+            cells = ''.join(f"{np.mean([r[f'{v}_{m}'] for r in g]):>11.2f}/{np.median([r[f'{v}_{m}'] for r in g]):<8.2f}"
+                            for v in ('med3', 'vggt', 'med4', 'switch'))
+            L.append(f'{gname:<8}{len(g):>4}' + cells + f"{sum(r[f'switch_{m}_uses_vggt'] for r in g):>12}/{len(g)}")
+        for v in ('vggt', 'med4', 'switch'):
+            for gname, g in (('train', tr), ('val', [r for r in rows if r['split'] == 'val'])):
+                if not g:
+                    continue
+                d = np.array([r[f'{v}_{m}'] - r[f'med3_{m}'] for r in g])
+                L.append(f'   {v:<7}{gname:<6} vs med3: better {int((d < -.5).sum())}, worse {int((d > .5).sum())}, '
+                         f'mean change {d.mean():+.2f}, worst loss {d.max():+.1f}')
+    L.append('\nworst clips (heading only, med3 DPVO):')
+    L.append(f"{'clip':<9}{'split':<6}" + ''.join(f'{v:>8}' for v in ('med3', 'vggt', 'med4', 'switch')) + ''.join(f'{c[:12]:>13}' for c in COMBO_FEATURES))
+    for r in sorted(rows, key=lambda r: -r['med3_head'])[:15]:
+        L.append(f"{r['key']:<9}{r['split']:<6}" + ''.join(f"{r[f'{v}_head']:>8.1f}" for v in ('med3', 'vggt', 'med4', 'switch'))
+                 + ''.join(f"{r[c]:>13.1f}" for c in COMBO_FEATURES))
     return '\n'.join(L), rows
 
 
@@ -1050,7 +1139,9 @@ def main(argv=None):
     ap.add_argument('--speed-params', type=Path, help='speed filter thresholds JSON (from --speed-tune)')
     ap.add_argument('--heading-poses', type=Path, nargs='+', help='run_dpvo.py dirs for the median heading (e.g. 3 seeds)')
     ap.add_argument('--workers', type=int, default=8)
-    ap.add_argument('--compare-runs', nargs='+', help='LABEL=POSEDIR[:SPEEDDIR] single DPVO runs to compare (first = base)')
+    ap.add_argument('--combo-vggt', type=Path, help='VGGT run dir: evaluate VGGT/DPVO heading combinations (wide)')
+    ap.add_argument('--compare-runs', nargs='+',
+                    help='LABEL=POSEDIR[+POSEDIR...][:SPEEDDIR]; several pose dirs = circular-median heading (first = base)')
     ap.add_argument('--zoom-analysis', action='store_true', help='flir-VIS focal: why the residual detector works or not')
     ap.add_argument('--focal-base', type=Path, nargs='+', help='focal report: base run dirs (e.g. 3 seeds at x1.0)')
     ap.add_argument('--focal-new', type=Path, nargs='+', help='focal report: run dirs at the new focal scale')
@@ -1067,12 +1158,21 @@ def main(argv=None):
     if any(c['reference'] is None for c in selected):
         ap.error('oracle needs references; test clips have none')
     root = args.dataset.resolve().parent
+    if args.combo_vggt:
+        params = read_json(args.speed_params) if args.speed_params else None
+        text, rows = combo_eval(root, selected, [REPO_ROOT / f'runs/dpvo-fps8-seed{s}' for s in range(3)],
+                                args.combo_vggt, REPO_ROOT / 'runs/flow-v2', params, args.workers)
+        args.output.mkdir(parents=True, exist_ok=True)
+        write_csv(args.output / 'combo.csv', rows)
+        (args.output / 'combo.txt').write_text(text + '\n')
+        print(text)
+        return 0
     if args.compare_runs:
         runs = {}
         for spec in args.compare_runs:
             label, rest = spec.split('=', 1)
             pose, _, speed = rest.partition(':')
-            runs[label] = (REPO_ROOT / pose, (REPO_ROOT / speed) if speed else None)
+            runs[label] = ([REPO_ROOT / d for d in pose.split('+')], (REPO_ROOT / speed) if speed else None)
         params = read_json(args.speed_params) if args.speed_params else None
         text, rows = compare_runs_heading(root, selected, runs, params, args.workers)
         args.output.mkdir(parents=True, exist_ok=True)

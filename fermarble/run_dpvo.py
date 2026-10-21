@@ -14,6 +14,7 @@ skipped on resume unless --retry-failed is given. Never reads references.
 from __future__ import annotations
 import argparse
 import gc
+import json
 import os
 import time
 import traceback
@@ -79,6 +80,8 @@ def main(argv=None):
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--dpvo-buffer-size', type=int)
     ap.add_argument('--retry-failed', action='store_true', help='rerun clips recorded as failed')
+    ap.add_argument('--inpaint-rects', help='inpaint these overlay rectangles before DPVO: JSON list of '
+                                            '[x0,y0,x1,y1] in full-resolution video pixels (see overlay.py)')
     ap.add_argument('--patch-strategy', choices=['RANDOM', 'GRADIENT_BIAS'], default='RANDOM',
                     help="DPVO's patch centre selection (pinned DPVO option CENTROID_SEL_STRAT); "
                          'GRADIENT_BIAS keeps the most textured third of 3x random candidates')
@@ -96,6 +99,11 @@ def main(argv=None):
         thermal.install()  # track() now decodes through thermal.clahe_stream_worker
     if args.dpvo_diag:
         install_dpvo_diagnostics()
+    if args.inpaint_rects:
+        if args.clahe:
+            ap.error('--inpaint-rects and --clahe both replace the decoder; use one')
+        import overlay
+        overlay.install(json.loads(args.inpaint_rects))
     if args.patch_strategy != 'RANDOM':
         import tracking
         base_config = tracking._dpvo_config
@@ -123,6 +131,8 @@ def main(argv=None):
     manifest_path = args.output / 'run_manifest.json'
     run = read_json(manifest_path) if manifest_path.is_file() else dict(clips={})
     settings = dict(target_fps=args.target_fps, seed=args.seed, dpvo_buffer_size=args.dpvo_buffer_size)
+    if args.inpaint_rects:  # key only when used, so older runs still resume
+        settings['inpaint_rects'] = json.loads(args.inpaint_rects)
     if args.patch_strategy != 'RANDOM':  # key only when used, so older runs still resume
         settings['patch_strategy'] = args.patch_strategy
     if args.focal_scale != 1.0:  # key only when used, so older runs still resume
