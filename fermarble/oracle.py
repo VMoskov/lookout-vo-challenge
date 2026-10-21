@@ -28,7 +28,7 @@ import numpy as np
 from common import (DEFAULT_DATASET, NO_LIMIT, REPO_ROOT, SMOOTH_SIGMA_S, START_WINDOW_S, clean_poses,
                     filter_flow_speed, flow_reliable_speed, flow_speed_from_reliable, multi_run_heading,
                     read_json, rolling_median, speed_variation, flow_quality_features, horizon_jump,
-                    quat_to_rotmat, estimate_up, forward_motion_cosine, gap_aware_coverage,
+                    quat_to_rotmat, estimate_up, forward_motion_cosine, heading_divergence_60s, gap_aware_coverage,
                     forward_motion_cosine, heading_at_frames, heading_constant_speed, integrate_planar, load_manifest,
                     load_pose_npz, load_timestamps, motion_heading, pose_heading, select_clips,
                     smooth_in_time, straight_line, write_json)
@@ -1029,9 +1029,7 @@ def _combo_clip(args):
         dd = wrap(med3 - hv)
         dd = dd - np.median(dd)
         row['dv_p95_deg'] = float(np.percentile(np.abs(dd), 95))
-        j = np.searchsorted(t, t + 60.0)
-        ok = j < len(t)
-        row['dv_win60_deg'] = float(np.abs(dd[j[ok]] - dd[ok]).max()) if ok.any() else np.nan
+        row['dv_win60_deg'] = heading_divergence_60s(t, med3, hv)
     return row
 
 
@@ -1083,6 +1081,47 @@ def combo_eval(root, clips, dpvo_dirs, vggt_dir, speed_dir, params, workers=8):
         L.append(f"{r['key']:<9}{r['split']:<6}" + ''.join(f"{r[f'{v}_head']:>8.1f}" for v in ('med3', 'vggt', 'med4', 'switch'))
                  + ''.join(f"{r[c]:>13.1f}" for c in COMBO_FEATURES))
     return '\n'.join(L), rows
+
+
+def _motion_clip(args):
+    """Heading from camera orientation vs from direction of motion (DPVO 3-seed and VGGT), each with
+    the true speed (heading-only drift), plus turn ratios against the true heading."""
+    from common import circular_median, _run_heading
+    root, clip, dpvo_dirs, vggt_dir = args
+    k = clip['key']
+    data = speed_clip_data(root, clip, None, [d / 'poses' / f'{k}.npz' for d in dpvo_dirs])
+    t = data['frame_t']
+    row = dict(key=k, split=clip['split'], camera_mode=clip['camera_mode'])
+    true_turn = np.unwrap(data['thf'])
+
+    def stats(h, name):
+        row[f'{name}_head'] = _score_speed(data, h, data['tvf'])
+        tt = np.degrees(true_turn - true_turn[0]); hh = np.degrees(h - h[0])
+        row[f'{name}_ratio'] = float((hh @ tt) / (tt @ tt)) if np.ptp(tt) >= 15 else np.nan
+
+    def motion_at_frames(poses, pt):
+        poses, pt = clean_poses(poses, pt)
+        if poses is None:
+            return None
+        mh = motion_heading(poses, pt, SMOOTH_SIGMA_S)
+        if mh is None:
+            return None
+        g, h, _ = mh
+        return np.interp(t, g, h)
+
+    stats(data['med3'], 'dpvo_orient')
+    mot = [motion_at_frames(z['poses'], z['times']) for z in (load_pose_npz(d / 'poses' / f'{k}.npz') for d in dpvo_dirs)]
+    mot = [m for m in mot if m is not None]
+    if mot:
+        stats(circular_median(mot) if len(mot) > 1 else mot[0], 'dpvo_motion')
+    zv = load_pose_npz(vggt_dir / 'poses' / f'{k}.npz')
+    hv, _ = _run_heading(zv['poses'], zv['times'], t, SMOOTH_SIGMA_S)
+    if hv is not None:
+        stats(hv, 'vggt_orient')
+    mv = motion_at_frames(zv['poses'], zv['times'])
+    if mv is not None:
+        stats(mv, 'vggt_motion')
+    return row
 
 
 def _failure_job(args):
@@ -1139,6 +1178,7 @@ def main(argv=None):
     ap.add_argument('--speed-params', type=Path, help='speed filter thresholds JSON (from --speed-tune)')
     ap.add_argument('--heading-poses', type=Path, nargs='+', help='run_dpvo.py dirs for the median heading (e.g. 3 seeds)')
     ap.add_argument('--workers', type=int, default=8)
+    ap.add_argument('--motion-check', type=Path, help='VGGT run dir: orientation vs motion-direction heading')
     ap.add_argument('--combo-vggt', type=Path, help='VGGT run dir: evaluate VGGT/DPVO heading combinations (wide)')
     ap.add_argument('--compare-runs', nargs='+',
                     help='LABEL=POSEDIR[+POSEDIR...][:SPEEDDIR]; several pose dirs = circular-median heading (first = base)')
@@ -1158,6 +1198,20 @@ def main(argv=None):
     if any(c['reference'] is None for c in selected):
         ap.error('oracle needs references; test clips have none')
     root = args.dataset.resolve().parent
+    if args.motion_check:
+        from concurrent.futures import ProcessPoolExecutor
+        dirs = [REPO_ROOT / f'runs/dpvo-fps8-seed{s}' for s in range(3)]
+        with ProcessPoolExecutor(args.workers) as ex:
+            rows = list(ex.map(_motion_clip, [(root, c, dirs, args.motion_check) for c in selected]))
+        args.output.mkdir(parents=True, exist_ok=True)
+        write_csv(args.output / 'motion_check.csv', rows)
+        V = ('dpvo_orient', 'dpvo_motion', 'vggt_orient', 'vggt_motion')
+        print(f"{'clip':<9}" + ''.join(f'{v + " drift/ratio":>24}' for v in V))
+        for r in rows:
+            print(f"{r['key']:<9}" + ''.join(f"{r.get(v + '_head', np.nan):>15.1f} / {r.get(v + '_ratio', np.nan):>+5.2f}" for v in V))
+        print(f"{'mean':<9}" + ''.join(f"{np.nanmean([r.get(v + '_head', np.nan) for r in rows]):>15.2f}{'':>9}" for v in V))
+        print(f"{'median':<9}" + ''.join(f"{np.nanmedian([r.get(v + '_head', np.nan) for r in rows]):>15.2f}{'':>9}" for v in V))
+        return 0
     if args.combo_vggt:
         params = read_json(args.speed_params) if args.speed_params else None
         text, rows = combo_eval(root, selected, [REPO_ROOT / f'runs/dpvo-fps8-seed{s}' for s in range(3)],

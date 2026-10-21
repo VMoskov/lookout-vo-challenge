@@ -451,6 +451,32 @@ def flow_quality_features(d, agree_tol=0.6):
     return f
 
 
+def heading_divergence_60s(t, h_a, h_b, window_s=60.0):
+    """Largest change, within any window_s window, of the wrapped difference between two heading
+    series (rad, at the same times), after removing its median: how far two heading sources
+    drift apart over a minute (deg). Used by the DPVO/VGGT switch."""
+    d = np.degrees(np.angle(np.exp(1j * (np.asarray(h_a) - np.asarray(h_b)))))
+    d = d - np.median(d)
+    j = np.searchsorted(t, np.asarray(t) + window_s)
+    ok = j < len(t)
+    return float(np.abs(d[j[ok]] - d[ok]).max()) if ok.any() else float('nan')
+
+
+# DPVO/VGGT heading switch (fitted on wide train clips, oracle.py --combo-vggt): use VGGT's heading for a
+# clip when it and DPVO's 3-seed median diverge by more than this within some 60 s window.
+VGGT_SWITCH_DEG = 54.25
+
+
+def total_turn_deg(h):
+    """Total absolute heading change (deg) of a per-frame heading series (rad)."""
+    return float(np.degrees(np.abs(np.angle(np.exp(1j * np.diff(np.asarray(h))))).sum()))
+
+
+def finite_fraction(poses):
+    """Fraction of pose rows that are entirely finite."""
+    return float(np.isfinite(np.asarray(poses)).all(1).mean()) if len(poses) else 0.0
+
+
 # Thresholds of filter_flow_speed. Defaults are placeholders; oracle.py --speed-tune fits them on
 # TRAIN clips only and writes them to a JSON file that make_predictions.py --speed-params reads.
 # (NO_LIMIT instead of inf so the parameters stay valid JSON.)
