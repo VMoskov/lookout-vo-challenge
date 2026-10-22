@@ -475,6 +475,54 @@ def total_turn_deg(h):
     return float(np.degrees(np.abs(np.angle(np.exp(1j * np.diff(np.asarray(h))))).sum()))
 
 
+def heading_change_rms_60s(t, h_a, h_b, window_s=60.0):
+    """RMS (deg) over the clip of the difference between two headings' changes within window_s:
+    [a(t+w) - a(t)] - [b(t+w) - b(t)], wrapped. Insensitive to constant offsets."""
+    t = np.asarray(t)
+    j = np.searchsorted(t, t + window_s)
+    ok = j < len(t)
+    if not ok.any():
+        return float('nan')
+    d = (np.asarray(h_a)[j[ok]] - np.asarray(h_a)[ok]) - (np.asarray(h_b)[j[ok]] - np.asarray(h_b)[ok])
+    return float(np.degrees(np.sqrt(np.mean(np.angle(np.exp(1j * d)) ** 2))))
+
+
+POSE_SPEED_SIGMA_S = 4.0
+
+
+def pose_speed(poses, times, frame_times, sigma_s=POSE_SPEED_SIGMA_S, clamp_lo=0.25, clamp_hi=4.0, disp=None):
+    """Relative speed at every frame from camera centres (e.g. VGGT/Pi3X): horizontal displacement
+    (perpendicular to the estimated up) per second between consecutive poses, Gaussian-smoothed
+    in time, interpolated to frame_times, divided by its median and clamped to [clamp_lo, clamp_hi].
+    Only the shape matters (the metric's Sim(3) absorbs scale). With `disp` (per-pose displacement
+    from the previous pose in each window's own, e.g. metric, scale: vggt_tool window_disp) it is
+    used instead of differencing the chained centres. None without usable poses."""
+    poses, times = np.asarray(poses, float), np.asarray(times, float)
+    if disp is not None:
+        ok = np.isfinite(poses).all(1) & np.isfinite(disp).all(1)
+        if ok.sum() < MIN_POSES:
+            return None
+        d, dt, tm = disp[ok], np.diff(np.concatenate([[times[0]], times]))[ok], times[ok]
+        poses = poses[ok]
+    else:
+        poses, times = clean_poses(poses, times)
+        if poses is None:
+            return None
+        d, dt, tm = np.diff(poses[:, :3], axis=0), np.diff(times), 0.5 * (times[1:] + times[:-1])
+    up = estimate_up(quat_to_rotmat(poses[:, 3:7]))
+    if up is None:
+        return None
+    d = d - np.outer(d @ up, up)
+    keep = dt > 0
+    v, times_v = np.linalg.norm(d[keep], axis=1) / dt[keep], tm[keep]
+    g, vs = smooth_in_time(times_v, v, sigma_s)
+    s = np.interp(frame_times, g, vs)
+    med = np.median(s)
+    if not np.isfinite(med) or med <= 0:
+        return None
+    return np.clip(s / med, clamp_lo, clamp_hi)
+
+
 def finite_fraction(poses):
     """Fraction of pose rows that are entirely finite."""
     return float(np.isfinite(np.asarray(poses)).all(1).mean()) if len(poses) else 0.0

@@ -37,14 +37,32 @@ import thermal  # noqa: E402
 VGGT_WIDTH = 518
 
 
-def keyframes(root, clip, fps):
+def shifted_frames(pre, frame_times, phase):
+    """Like ClipPreprocessor.frames_with_time (every stride-th decoded frame), with the kept frames
+    shifted later by round(phase * stride) decoded frames."""
+    off = int(round(phase * pre.stride))
+    cap = cv2.VideoCapture(pre.video_path)
+    try:
+        idx = -1
+        while True:
+            ok, image = cap.read()
+            if not ok:
+                break
+            idx += 1
+            if idx >= off and (idx - off) % pre.stride == pre.stride - 1 and idx < len(frame_times):
+                yield None, pre.transform(image), None, float(frame_times[idx]), idx
+    finally:
+        cap.release()
+
+
+def keyframes(root, clip, fps, phase=0.0):
     from preprocessing import ClipPreprocessor
     t = load_timestamps(root, clip)
     pre = ClipPreprocessor(str(asset_path(root, clip['video'])), clip['camera_mode'], fps,
                            calibration=clip['calibration'], frame_timestamps=t)
     clahe = cv2.createCLAHE(thermal.CLAHE_CLIP_LIMIT, thermal.CLAHE_TILE_GRID) if clip['camera_mode'] in thermal.THERMAL_MODES else None
     imgs, times, dec = [], [], []
-    for _, img, _, pts, d in pre.frames_with_time():
+    for _, img, _, pts, d in (shifted_frames(pre, t, phase) if phase else pre.frames_with_time()):
         if clahe is not None:
             img = thermal.apply_clahe(img, clahe)
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -84,16 +102,18 @@ def project_so3(M):
     return U @ D @ Vt
 
 
-def process_clip(model, root, clip, fps, window, overlap, run=run_window, inject_scale=None):
+def process_clip(model, root, clip, fps, window, overlap, run=run_window, inject_scale=None, phase=0.0):
     """Chained poses and per-window FOV of one clip. `run(model, frames, K)` returns one window's
     camera-to-world rotations, centres and fx; with `inject_scale` it gets the released keyframe
-    intrinsics with fx, fy scaled by it (else K=None)."""
+    intrinsics with fx, fy scaled by it (else K=None). `phase` (0..1) shifts the keyframes by that
+    fraction of the keyframe interval."""
     t0 = time.time()
-    frames, times, dec, nominal, n_frames, K = keyframes(root, clip, fps)
+    frames, times, dec, nominal, n_frames, K = keyframes(root, clip, fps, phase)
     K = np.diag([inject_scale, inject_scale, 1.0]) @ K if inject_scale is not None else None
     n = len(frames)
     R = np.full((n, 3, 3), np.nan)
     C = np.full((n, 3), np.nan)
+    disp = np.full((n, 3), np.nan)   # displacement from the previous keyframe in its window's own scale (unchained)
     hfov_w, centre_t = [], []
     starts = list(range(0, max(1, n - overlap), window - overlap))
     for s in starts:
@@ -105,6 +125,7 @@ def process_clip(model, root, clip, fps, window, overlap, run=run_window, inject
         centre_t.append(float(times[(s + e - 1) // 2]))
         if s == 0:
             R[s:e], C[s:e] = Rw, Cw
+            disp[s + 1:e] = np.diff(Cw, axis=0)
             continue
         ov = np.arange(s, min(s + overlap, e))
         k = ov - s
@@ -116,6 +137,7 @@ def process_clip(model, root, clip, fps, window, overlap, run=run_window, inject
         new = np.arange(s + len(ov), e)
         R[new] = np.einsum('ij,njk->nik', G, Rw[new - s])
         C[new] = sc * (Cw[new - s] @ G.T) + tr
+        disp[new] = (Cw[new - s] - Cw[new - s - 1]) @ G.T
     ok = np.isfinite(R).all((1, 2))
     poses = np.full((n, 7), np.nan)
     poses[ok, :3] = C[ok]
@@ -123,7 +145,7 @@ def process_clip(model, root, clip, fps, window, overlap, run=run_window, inject
     return dict(poses=poses, times=times, frame_indices=dec, tracker_indices=np.arange(n),
                 n_frames=np.int64(n_frames), window_hfov_deg=np.array(hfov_w), window_time=np.array(centre_t),
                 nominal_hfov_deg=np.float64(nominal), keyframe_fps=np.float64(fps),
-                window=np.int64(window), overlap=np.int64(overlap)), time.time() - t0
+                window=np.int64(window), overlap=np.int64(overlap), window_disp=disp), time.time() - t0
 
 
 def build_parser(description):
@@ -135,6 +157,7 @@ def build_parser(description):
     ap.add_argument('--keyframe-fps', type=float, default=2.0)
     ap.add_argument('--window', type=int, default=24)
     ap.add_argument('--overlap', type=int, default=4)
+    ap.add_argument('--phase', type=float, default=0.0, help='shift keyframes by this fraction of their interval')
     return ap
 
 
@@ -152,7 +175,10 @@ def run_clips(model, args, run=run_window, inject_scale=None, name='vggt'):
             print(c['key'], 'done, skipping', flush=True)
             continue
         try:
-            res, secs = process_clip(model, root, c, args.keyframe_fps, args.window, args.overlap, run, inject_scale)
+            res, secs = process_clip(model, root, c, args.keyframe_fps, args.window, args.overlap, run, inject_scale,
+                                     args.phase)
+            if args.phase:
+                res['keyframe_phase'] = np.float64(args.phase)
             if inject_scale is not None:
                 res['inject_focal_scale'] = np.float64(inject_scale)
             np.savez(out / f"{c['key']}.npz", **res)
