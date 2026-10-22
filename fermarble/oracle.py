@@ -980,6 +980,7 @@ def compare_runs_heading(root, clips, runs, params, workers=8):
         L.append(f'== {name}, drift %')
         L.append(f"{'group':<14}{'n':>4}" + ''.join(f'{l + " mean/med":>24}' for l in labels) + '   better/worse vs ' + base)
         groups = [('all', rows)] + [(sp, [r for r in rows if r['split'] == sp]) for sp in ('train', 'val')]
+        groups += [(m, [r for r in rows if r['camera_mode'] == m]) for m in sorted({r['camera_mode'] for r in rows})]
         for gname, g in groups:
             if not g:
                 continue
@@ -1161,6 +1162,42 @@ def format_table(title, table):
     return '\n'.join(lines)
 
 
+def focal_lower_bound(clips, runs):
+    """Oracle focal lower bound: per clip, the focal run with the lowest official drift.
+
+    `runs` maps a label (focal scale) to a predictions run scored by starter/evaluate.py
+    (its results.json); the first label is the x1.0 base. A clip missing from a run (no sweep
+    for its camera type) keeps the base. Returns (text, rows)."""
+    res = {lab: {r['key']: r['drift_pct'] for r in read_json(d / 'results.json') if r.get('drift_pct') is not None}
+           for lab, d in runs.items()}
+    base = next(iter(runs))
+    rows = []
+    for c in clips:
+        k = c['key']
+        cand = {lab: r[k] for lab, r in res.items() if k in r}
+        best = min(cand, key=cand.get)
+        rows.append(dict(key=k, split=c['split'], camera_mode=c['camera_mode'], base=cand[base], best_label=best,
+                         best=cand[best], **{f'drift_{lab}': cand.get(lab, np.nan) for lab in runs}))
+    L = [f"== oracle focal lower bound (per clip best of {', '.join(runs)}; base {base})",
+         f"{'group':<10}{'n':>4}{'base mean/med':>18}{'best mean/med':>18}  best focal counts"]
+    groups = [('all', rows)] + [(m, [r for r in rows if r['camera_mode'] == m])
+                                for m in sorted({r['camera_mode'] for r in rows})]
+    for name, g in groups:
+        b, o = [r['base'] for r in g], [r['best'] for r in g]
+        counts = {lab: sum(r['best_label'] == lab for r in g) for lab in runs}
+        L.append(f"{name:<10}{len(g):>4}{np.mean(b):>11.2f}/{np.median(b):<6.2f}{np.mean(o):>11.2f}/{np.median(o):<6.2f}"
+                 f"  {', '.join(f'{lab}:{n}' for lab, n in counts.items() if n)}")
+    L.append(f"with perfect focal, dev drift would be {np.mean([r['best'] for r in rows]):.2f} % "
+             f"instead of {np.mean([r['base'] for r in rows]):.2f} % (mean over {len(rows)} clips)")
+    L.append('')
+    L.append(f"{'clip':<9}{'mode':<9}" + ''.join(f'{lab:>8}' for lab in runs) + '    best')
+    for r in rows:
+        if sum(np.isfinite(r[f'drift_{lab}']) for lab in runs) > 1:
+            L.append(f"{r['key']:<9}{r['camera_mode']:<9}" + ''.join(f"{r[f'drift_{lab}']:>8.2f}" for lab in runs)
+                     + f"    {r['best_label']}")
+    return '\n'.join(L), rows
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--dataset', type=Path, default=DEFAULT_DATASET)
@@ -1186,6 +1223,8 @@ def main(argv=None):
     ap.add_argument('--focal-base', type=Path, nargs='+', help='focal report: base run dirs (e.g. 3 seeds at x1.0)')
     ap.add_argument('--focal-new', type=Path, nargs='+', help='focal report: run dirs at the new focal scale')
     ap.add_argument('--focal-diag', nargs='*', default=[], help='focal report: SCALE=DIR diag runs (run_dpvo --dpvo-diag)')
+    ap.add_argument('--focal-lower-bound', nargs='+',
+                    help='LABEL=PREDDIR (scored by evaluate.py), first = x1.0 base: per-clip best focal (oracle)')
     ap.add_argument('--worst', type=int, default=0,
                     help='also list the N worst clips, classify speed/heading/DPVO failure (needs --heading-diff)')
     args = ap.parse_args(argv)
@@ -1232,6 +1271,14 @@ def main(argv=None):
         args.output.mkdir(parents=True, exist_ok=True)
         write_csv(args.output / 'compare_runs.csv', rows)
         (args.output / 'compare_runs.txt').write_text(text + '\n')
+        print(text)
+        return 0
+    if args.focal_lower_bound:
+        runs = {kv.split('=', 1)[0]: Path(kv.split('=', 1)[1]) for kv in args.focal_lower_bound}
+        text, rows = focal_lower_bound(selected, runs)
+        args.output.mkdir(parents=True, exist_ok=True)
+        write_csv(args.output / 'focal_lower_bound.csv', rows)
+        (args.output / 'focal_lower_bound.txt').write_text(text + '\n')
         print(text)
         return 0
     if args.zoom_analysis:

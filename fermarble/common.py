@@ -465,6 +465,9 @@ def heading_divergence_60s(t, h_a, h_b, window_s=60.0):
 # DPVO/VGGT heading switch (fitted on wide train clips, oracle.py --combo-vggt): use VGGT's heading for a
 # clip when it and DPVO's 3-seed median diverge by more than this within some 60 s window.
 VGGT_SWITCH_DEG = 54.25
+# broken-seed rule (also VGGT): a seed's finite-pose fraction below this and the DPVO median turning less than this
+BROKEN_SEED_FINITE = 0.5
+BROKEN_SEED_TURN_DEG = 10.0
 
 
 def total_turn_deg(h):

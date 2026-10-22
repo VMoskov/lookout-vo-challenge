@@ -57,10 +57,14 @@ def keyframes(root, clip, fps):
         times.append(pts)
         dec.append(d)
     nominal = math.degrees(2 * math.atan(pre.intrinsics.width / 2 / pre.intrinsics.fx))
-    return np.stack(imgs), np.array(times), np.array(dec), nominal, len(t)
+    sx, sy = VGGT_WIDTH / w, nh / h                         # released intrinsics in the resized, cropped keyframe
+    K = np.array([[pre.intrinsics.fx * sx, 0, pre.intrinsics.cx * sx],
+                  [0, pre.intrinsics.fy * sy, pre.intrinsics.cy * sy - o], [0, 0, 1]])
+    return np.stack(imgs), np.array(times), np.array(dec), nominal, len(t), K
 
 
-def run_window(model, frames):
+def run_window(model, frames, K=None):
+    """VGGT on one window; K (intrinsics injection) is not supported and ignored."""
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
     x = torch.from_numpy(frames).cuda().permute(0, 3, 1, 2).float().div(255)[None]
     with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
@@ -80,9 +84,13 @@ def project_so3(M):
     return U @ D @ Vt
 
 
-def process_clip(model, root, clip, fps, window, overlap):
+def process_clip(model, root, clip, fps, window, overlap, run=run_window, inject_scale=None):
+    """Chained poses and per-window FOV of one clip. `run(model, frames, K)` returns one window's
+    camera-to-world rotations, centres and fx; with `inject_scale` it gets the released keyframe
+    intrinsics with fx, fy scaled by it (else K=None)."""
     t0 = time.time()
-    frames, times, dec, nominal, n_frames = keyframes(root, clip, fps)
+    frames, times, dec, nominal, n_frames, K = keyframes(root, clip, fps)
+    K = np.diag([inject_scale, inject_scale, 1.0]) @ K if inject_scale is not None else None
     n = len(frames)
     R = np.full((n, 3, 3), np.nan)
     C = np.full((n, 3), np.nan)
@@ -92,7 +100,7 @@ def process_clip(model, root, clip, fps, window, overlap):
         e = min(n, s + window)
         if e - s < max(3, overlap + 1):
             break
-        Rw, Cw, fx = run_window(model, frames[s:e])
+        Rw, Cw, fx = run(model, frames[s:e], K)
         hfov_w.append(float(np.median(np.degrees(2 * np.arctan(VGGT_WIDTH / 2 / fx)))))
         centre_t.append(float(times[(s + e - 1) // 2]))
         if s == 0:
@@ -118,8 +126,8 @@ def process_clip(model, root, clip, fps, window, overlap):
                 window=np.int64(window), overlap=np.int64(overlap)), time.time() - t0
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def build_parser(description):
+    ap = argparse.ArgumentParser(description=description, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--dataset', type=Path, default=DEFAULT_DATASET)
     ap.add_argument('--split', default='train,val')
     ap.add_argument('--clips', help='comma-separated clip IDs; overrides --split')
@@ -127,28 +135,33 @@ def main(argv=None):
     ap.add_argument('--keyframe-fps', type=float, default=2.0)
     ap.add_argument('--window', type=int, default=24)
     ap.add_argument('--overlap', type=int, default=4)
-    args = ap.parse_args(argv)
-    from vggt.models.vggt import VGGT
-    model = VGGT.from_pretrained('facebook/VGGT-1B').to('cuda').eval()
+    return ap
+
+
+def run_clips(model, args, run=run_window, inject_scale=None, name='vggt'):
+    """process_clip on every selected clip (done clips are skipped); writes <output>/poses/<clip>.npz
+    and <output>/<name>_summary.json."""
     root = args.dataset.resolve().parent
     clips = select_clips(load_manifest(args.dataset), args.split, args.clips)
     out = args.output / 'poses'
     out.mkdir(parents=True, exist_ok=True)
-    summ_path = args.output / 'vggt_summary.json'
+    summ_path = args.output / f'{name}_summary.json'
     summary = json.loads(summ_path.read_text()) if summ_path.is_file() else {}
     for c in clips:
         if (out / f"{c['key']}.npz").is_file():
             print(c['key'], 'done, skipping', flush=True)
             continue
         try:
-            res, secs = process_clip(model, root, c, args.keyframe_fps, args.window, args.overlap)
+            res, secs = process_clip(model, root, c, args.keyframe_fps, args.window, args.overlap, run, inject_scale)
+            if inject_scale is not None:
+                res['inject_focal_scale'] = np.float64(inject_scale)
             np.savez(out / f"{c['key']}.npz", **res)
             h = res['window_hfov_deg']
             nom = float(res['nominal_hfov_deg'])
             med = float(np.median(h))
             summary[c['key']] = dict(camera_mode=c['camera_mode'], split=c['split'], n_keyframes=len(res['times']),
-                                     windows=len(h), nominal_hfov_deg=nom, vggt_hfov_median=med,
-                                     vggt_hfov_iqr=[float(np.percentile(h, 25)), float(np.percentile(h, 75))],
+                                     windows=len(h), nominal_hfov_deg=nom, **{f'{name}_hfov_median': med,
+                                     f'{name}_hfov_iqr': [float(np.percentile(h, 25)), float(np.percentile(h, 75))]},
                                      focal_scale=math.tan(math.radians(nom) / 2) / math.tan(math.radians(med) / 2),
                                      finite_rot=float(np.isfinite(res['poses']).all(1).mean()), seconds=round(secs, 1))
         except Exception as exc:
@@ -156,6 +169,13 @@ def main(argv=None):
         write_json(summ_path, summary)
         print(c['key'], summary[c['key']], flush=True)
     return 0
+
+
+def main(argv=None):
+    args = build_parser(__doc__).parse_args(argv)
+    from vggt.models.vggt import VGGT
+    model = VGGT.from_pretrained('facebook/VGGT-1B').to('cuda').eval()
+    return run_clips(model, args)
 
 
 if __name__ == '__main__':

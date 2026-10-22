@@ -20,11 +20,13 @@ import numpy as np
 from common import (DEFAULT_DATASET, SMOOTH_SIGMA_S, heading_constant_speed, load_manifest,
                     filter_flow_speed, load_pose_npz, load_timestamps, multi_run_heading_constant_speed,
                     multi_run_heading, _run_heading, heading_divergence_60s, integrate_planar, VGGT_SWITCH_DEG,
-                    finite_fraction, total_turn_deg, prediction_dict, select_clips, validate_prediction, write_json)
+                    finite_fraction, total_turn_deg, BROKEN_SEED_FINITE, BROKEN_SEED_TURN_DEG,
+                    prediction_dict, select_clips, validate_prediction, write_json)
 
 
 def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, speed_path=None,
-                 speed_params=None, vggt_path=None, switch_deg=VGGT_SWITCH_DEG, vggt_member=False, flat_rule=None):
+                 speed_params=None, vggt_path=None, switch_deg=VGGT_SWITCH_DEG, vggt_member=False, flat_rule=None,
+                 broken_seed=None, tiebreak_path=None):
     """Returns (prediction dict, info dict) for one clip.
 
     `pose_paths` lists one npz per DPVO run (e.g. per seed); several runs are combined by the
@@ -35,7 +37,10 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, s
     median by > `switch_deg` within 60 s (None: no switch); `vggt_member` also adds VGGT as one
     more member of the median. `flat_rule` (X, Y, Z) also uses VGGT's heading when DPVO looks
     flat or broken: (DPVO median total turn < X deg or a seed's finite-pose fraction < Y) and
-    VGGT's total turn > Z deg (None: no flat rule).
+    VGGT's total turn > Z deg (None: no flat rule). `broken_seed` (F, T) uses VGGT's heading when a
+    seed's finite-pose fraction < F and the DPVO median total turn < T deg (None: off).
+    With `tiebreak_path` (a third heading source, e.g. Pi3X, same npz format) a firing switch is
+    kept only if VGGT's heading is closer to it than the DPVO median's (60 s divergence).
     """
     frame_times = load_timestamps(root, clip)
     runs, errors = [], []
@@ -83,11 +88,24 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, s
                 div = heading_divergence_60s(frame_times, h, hv)
                 info.update(vggt_divergence_deg=div, vggt_switch=bool(div > switch_deg))
                 use_vggt = div > switch_deg
+                if use_vggt and tiebreak_path is not None and tiebreak_path.is_file():
+                    zt = load_pose_npz(tiebreak_path)
+                    ht = _run_heading(zt['poses'], zt['times'], frame_times, sigma_s)[0]
+                    if ht is not None:
+                        d_dpvo, d_vggt = heading_divergence_60s(frame_times, h, ht), heading_divergence_60s(frame_times, hv, ht)
+                        use_vggt = d_vggt < d_dpvo
+                        info.update(tiebreak_dpvo_deg=d_dpvo, tiebreak_vggt_deg=d_vggt, vggt_switch=bool(use_vggt))
+            turn = total_turn_deg(h) if h is not None else 0.0
+            finite = min([finite_fraction(p) for p, _ in dpvo_runs] + [0.0] * (len(pose_paths or []) - len(dpvo_runs)))
+            if broken_seed is not None:
+                # broken-seed rule: a seed lost most of its poses and the DPVO median barely turns
+                min_finite, max_turn = broken_seed
+                fires = finite < min_finite and turn < max_turn
+                info.update(dpvo_total_turn_deg=turn, min_finite_frac=finite, broken_seed_rule=bool(fires and not use_vggt))
+                use_vggt = use_vggt or fires
             if flat_rule is not None:
                 # flat-DPVO rule: DPVO barely turns or a seed lost most of its poses, while VGGT turns
                 max_turn, min_finite, min_vggt_turn = flat_rule
-                turn = total_turn_deg(h) if h is not None else 0.0
-                finite = min([finite_fraction(p) for p, _ in dpvo_runs] + [0.0] * (len(pose_paths or []) - len(dpvo_runs)))
                 vturn = total_turn_deg(hv)
                 fires = (turn < max_turn or finite < min_finite) and vturn > min_vggt_turn
                 info.update(dpvo_total_turn_deg=turn, min_finite_frac=finite, vggt_total_turn_deg=vturn,
@@ -128,6 +146,10 @@ def main(argv=None):
                          'the DPVO-only median with VGGT')
     ap.add_argument('--flat-rule', help='X,Y,Z: VGGT heading if (DPVO median total turn < X deg or a seed '
                                         'finite-pose fraction < Y) and VGGT total turn > Z deg')
+    ap.add_argument('--tiebreak', type=Path, help='third heading source run dir (e.g. Pi3X): decides a firing switch')
+    ap.add_argument('--broken-seed', default=f'{BROKEN_SEED_FINITE},{BROKEN_SEED_TURN_DEG}',
+                    help="F,T: in --switch-modes, VGGT heading if a seed's finite-pose fraction < F and the DPVO "
+                         "median total turn < T deg (default on; 'off' disables)")
     ap.add_argument('--flat-modes', default='wide,flir-VIS,flir-IR', help='camera modes where the flat rule applies')
     args = ap.parse_args(argv)
     if args.invert_poses and len(args.poses or []) > 1:
@@ -138,6 +160,7 @@ def main(argv=None):
     selected = select_clips(manifest, args.split, args.clips)
     root = args.dataset.resolve().parent
     speed_params = json.loads(args.speed_params.read_text()) if args.speed_params else None
+    broken_seed = None if args.broken_seed == 'off' else tuple(float(x) for x in args.broken_seed.split(','))
     flat_rule = tuple(float(x) for x in args.flat_rule.split(',')) if args.flat_rule else None
     records = {}
     for clip in selected:
@@ -151,7 +174,8 @@ def main(argv=None):
                                   args.speed / 'speed' / f'{key}.npz' if use_speed else None, speed_params,
                                   args.vggt / 'poses' / f'{key}.npz' if use_vggt else None,
                                   args.switch_deg if use_switch else None, args.vggt_member,
-                                  flat_rule if use_flat else None)
+                                  flat_rule if use_flat else None, broken_seed if use_switch else None,
+                                  args.tiebreak / 'poses' / f'{key}.npz' if use_switch and args.tiebreak else None)
         write_json(args.output / 'predictions' / f'{key}.json', pred)
         # JSON cannot hold NaN: a diagnostic that is undefined for a clip is recorded as null
         info = {k: (None if isinstance(v, float) and not np.isfinite(v) else v) for k, v in info.items()}
@@ -165,6 +189,8 @@ def main(argv=None):
                     vggt=str(args.vggt) if args.vggt else None, switch_deg=args.switch_deg if args.vggt else None,
                     switch_modes=args.switch_modes if args.vggt else None,
                     vggt_member=args.vggt_member if args.vggt else None,
+                    broken_seed=list(broken_seed) if args.vggt and broken_seed else None,
+                    tiebreak=str(args.tiebreak) if args.vggt and args.tiebreak else None,
                     flat_rule=list(flat_rule) if args.vggt and flat_rule else None,
                     flat_modes=args.flat_modes if args.vggt and flat_rule else None,
                     invert_poses=args.invert_poses, clips=records))
