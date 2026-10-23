@@ -30,8 +30,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from common import (DEFAULT_DATASET, asset_path, estimate_up, load_manifest, load_pose_npz,
-                    load_timestamps, quat_to_rotmat, select_clips, write_json)
+from common import (DEFAULT_DATASET, asset_path, estimate_up, load_manifest, load_pose_npz, load_timestamps,
+                    quat_to_rotmat, select_clips, smooth_in_time, write_json)
 
 GRID_STEP = 8                 # px between flow samples on the (half-res) DPVO frame
 MIN_DEPRESSION_DEG = 1.5      # water starts this far below the horizon
@@ -40,6 +40,8 @@ STATIC_FLOW_PX = 0.3          # 80th-percentile |flow| below this = never moves 
 HORIZON_SAMPLES = 48          # frames used for the coarse per-clip horizon correction
 HORIZON_WINDOW_S = 20.0       # then refitted locally in windows of this length
 MIN_BAND_PIXELS = 40
+STILL_REL = 0.25              # --drop-still: |flow| below this x the median |flow| of its grid row in that pair ...
+STILL_RUN = 16                # ... for at least this many consecutive pairs (2 s at 8 fps) = lens droplet / static spot
 HUBER_PX = 1.0
 
 
@@ -221,9 +223,101 @@ def resampled_rotations(path, times):
     return R, ok
 
 
-def process_clip(root, clip, pose_paths, out_path, target_fps=8.0, focal_scale=1.0, rot_path=None):
+def still_runs(flows, gy_rows, rel=STILL_REL, run=STILL_RUN):
+    """(pairs, points) mask of samples whose flow stays far below that of their image row (|flow| <
+    rel x the row median) for >= run consecutive pairs: lens droplets and other spots that do not move
+    with the scene, which the clip-wide static mask misses when they come and go."""
+    mag = np.linalg.norm(flows, axis=2)                                    # pairs x points
+    rows = np.unique(gy_rows)
+    rowmed = np.empty_like(mag)
+    for r in rows:
+        sel = gy_rows == r
+        rowmed[:, sel] = np.median(mag[:, sel], axis=1, keepdims=True)
+    still = mag < np.maximum(rel * rowmed, 0.02)
+    c = np.concatenate([np.zeros((1, still.shape[1])), np.cumsum(still, 0)])
+    full = (c[run:] - c[:-run]) == run                                     # window [k, k+run) all still
+    f = np.concatenate([np.zeros((1, still.shape[1])), np.cumsum(full, 0)])
+    out = np.zeros_like(still)
+    for k in range(still.shape[0]):                                        # pair k inside any full window
+        lo, hi = max(0, k - run + 1), min(full.shape[0], k + 1)
+        out[k] = (f[hi] - f[lo]) > 0 if hi > lo else False
+    return out
+
+
+SEG_WATER = 10                # LaRS class id of water in seg_run.py masks
+SEG_MIN_COLS = 0.3            # segmentation horizon: fit a line only if >= this fraction of columns has water
+SEG_SIGMA_S = 1.0             # ... then median over 9 segmented frames and Gaussian smoothing in time
+
+
+def seg_water_points(seg, dec, p):
+    """(frames, points) bool: PanSR water at the grid points, from the nearest segmented frame."""
+    if not np.array_equal(seg['frame_indices'], dec):
+        raise ValueError('segmentation frames differ from the decoded frames')
+    q = int(seg['quarter'])
+    m = seg['masks']
+    yi = np.clip((p[:, 1] // q).astype(int), 0, m.shape[1] - 1)
+    xi = np.clip((p[:, 0] // q).astype(int), 0, m.shape[2] - 1)
+    sf = seg['seg_frames']
+    nearest = np.clip(np.searchsorted(sf, np.arange(len(dec))), 0, len(sf) - 1)
+    lower = np.clip(nearest - 1, 0, len(sf) - 1)
+    nearest = np.where(np.abs(sf[lower] - np.arange(len(dec))) < np.abs(sf[nearest] - np.arange(len(dec))), lower, nearest)
+    return m[:, yi, xi][nearest] == SEG_WATER
+
+
+def seg_horizon_lines(seg, H):
+    """Per segmented frame, a robust line (slope, intercept) through the top edge of the water region
+    (water/sky or water/shore boundary): least squares, then 3 rounds dropping residuals beyond
+    max(3 MAD, 2 px). NaN where too few columns have water or the fit keeps < half of them."""
+    W = seg['water_top'].shape[1]
+    xs = np.arange(W, dtype=float)
+    out = np.full((len(seg['water_top']), 2), np.nan)
+    for i, top in enumerate(seg['water_top']):
+        ok = (top > 0) & (top < H - 1)
+        if ok.mean() < SEG_MIN_COLS:
+            continue
+        x, y = xs[ok], top[ok].astype(float)
+        keep = np.ones(len(x), bool)
+        for _ in range(3):
+            m, c = np.polyfit(x[keep], y[keep], 1)
+            r = np.abs(y - (m * x + c))
+            keep = r <= max(3 * 1.4826 * np.median(r[keep]), 2.0)
+        if keep.mean() >= 0.5:
+            out[i] = np.polyfit(x[keep], y[keep], 1)
+    return out
+
+
+def seg_horizon_ups(seg, times, K, W, H):
+    """Camera-frame up vector per frame whose horizon (rays with u.r = 0) is the segmentation line,
+    median-filtered over 9 segmented frames and smoothed in time (SEG_SIGMA_S). None if no frame
+    has a line. The line is the visible water edge: the true horizon at open sea, the shoreline
+    (below the horizon) in harbours."""
+    lines = seg_horizon_lines(seg, H)
+    ok = np.isfinite(lines).all(1)
+    if ok.sum() < 3:
+        return None, lines
+    ts = times[seg['seg_frames']][ok]
+    L = lines[ok]
+    med = np.array([np.median(L[max(0, i - 4):i + 5], axis=0) for i in range(len(L))])
+    g, sm = smooth_in_time(ts, med, SEG_SIGMA_S) if len(ts) > 1 else (ts, med)
+    slope = np.interp(times, g, sm[:, 0])
+    icpt = np.interp(times, g, sm[:, 1])
+    fx, fy, cx, cy = K
+    ray = lambda x, y: np.stack([(x - cx) / fx, (y - cy) / fy, np.ones_like(x)], -1)
+    r1, r2 = ray(np.zeros_like(slope), icpt), ray(np.full_like(slope, W - 1.0), slope * (W - 1) + icpt)
+    u = np.cross(r1, r2)
+    u /= np.linalg.norm(u, axis=1, keepdims=True)
+    u[u[:, 1] > 0] *= -1                                    # up = camera -y side
+    return u, lines
+
+
+def process_clip(root, clip, pose_paths, out_path, target_fps=8.0, focal_scale=1.0, rot_path=None, drop_still=False,
+                 seg_path=None, variants=None):
     """Flow + water-plane speed for one clip. Returns a summary dict. With `rot_path` the rotations
-    (derotation, up) come from that run (resampled to the DPVO frames) instead of DPVO."""
+    (derotation, up) come from that run (resampled to the DPVO frames) instead of DPVO.
+    `variants` [(out_path, dict(mask=, horizon=, still=))] share one flow computation: `mask` keeps
+    only PanSR water (seg_run.py file `seg_path`), `horizon` places the band and the water-plane
+    geometry on the segmentation horizon instead of DPVO's, `still` = drop_still. Default: one
+    variant (out_path, no segmentation, drop_still)."""
     t0 = time.time()
     frames, dec, times, K = clip_frames(root, clip, target_fps, focal_scale)
     t_dec = time.time() - t0
@@ -259,6 +353,28 @@ def process_clip(root, clip, pose_paths, out_path, target_fps=8.0, focal_scale=1
     hp, hr, htable = fit_horizon_track(frames, ups, times, K, pose_ok)
     static = np.percentile(np.linalg.norm(flows, axis=2), 80, axis=0) < STATIC_FLOW_PX
     del frames
+    if variants is None:
+        variants = [(out_path, dict(mask=False, horizon=False, still=drop_still))]
+    seg = dict(np.load(seg_path)) if seg_path is not None else None
+    if seg is None and any(v['mask'] or v['horizon'] for _, v in variants):
+        raise FileNotFoundError('segmentation file needed for this variant')
+    segwater = seg_water_points(seg, dec, p) if seg is not None else None
+    useg, lines = seg_horizon_ups(seg, times, K, W, H) if seg is not None else (None, None)
+    still_all = still_runs(flows, gy.ravel()) if any(v['still'] for _, v in variants) else None
+    summary = None
+    for vpath, v in variants:
+        summary = _fit_variant(vpath, v, clip, flows, p, rays, static, still_all, segwater, useg, lines, R, ups, hp, hr,
+                               htable, pose_ok, times, dec, K, focal_scale, n, pose_used, t0, t_dec, t_flow)
+    return summary
+
+
+def _fit_variant(out_path, v, clip, flows, p, rays, static, still_all, segwater, useg, lines, R, ups, hp, hr, htable,
+                 pose_ok, times, dec, K, focal_scale, n, pose_used, t0, t_dec, t_flow):
+    """Steps 3-5 for one variant of process_clip (see there); writes out_path, returns the summary."""
+    drop_still = v['still']
+    still = still_all if drop_still else np.zeros((n - 1, len(p)), bool)
+    n_water = n_removed = n_seg_drop = 0
+    seg_h = v['horizon'] and useg is not None
 
     # 3-5. per pair: water pixels, near/far bands, robust fit
     keys = ('a_all', 'b_all', 'rmse_all', 'n_all', 'a_near', 'b_near', 'rmse_near', 'n_near',
@@ -267,9 +383,15 @@ def process_clip(root, clip, pose_paths, out_path, target_fps=8.0, focal_scale=1
     for k in range(n - 1):
         if not (pose_ok[k] and pose_ok[k + 1]):
             continue
-        u = correction(hp[k], hr[k]) @ ups[k]
+        u = useg[k] if seg_h else correction(hp[k], hr[k]) @ ups[k]
         u /= np.linalg.norm(u)
         water, s = water_region(rays, u, static)
+        if v['mask']:
+            n_seg_drop += int((water & ~segwater[k]).sum())
+            water &= segwater[k]
+        n_water += int(water.sum())
+        n_removed += int((water & still[k]).sum())
+        water &= ~still[k]
         if water.sum() < 2 * MIN_BAND_PIXELS:
             continue
         R_ji = R[k + 1].T @ R[k]
@@ -290,10 +412,17 @@ def process_clip(root, clip, pose_paths, out_path, target_fps=8.0, focal_scale=1
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(out_path, t_mid=t_mid, dt=dt, times=times, frame_indices=dec, **out, **speeds,
              horizon_pitch_deg=hp, horizon_roll_deg=hr, horizon_windows=htable,
-             static_frac=float(static.mean()), K=np.array(K), focal_scale=np.float64(focal_scale))
+             static_frac=float(static.mean()), K=np.array(K), focal_scale=np.float64(focal_scale),
+             drop_still=drop_still, still_removed=np.int64(n_removed), water_samples=np.int64(n_water),
+             still_points=np.int64(still.any(0).sum()), seg_mask=bool(v['mask']), seg_horizon=bool(seg_h),
+             seg_dropped=np.int64(n_seg_drop), **({'seg_lines': lines} if lines is not None else {}),
+             **({'seg_up': useg} if seg_h else {}))
     return dict(key=clip['key'], camera_mode=clip['camera_mode'], n_pairs=n - 1, poses=pose_used,
                 focal_scale=focal_scale,
                 valid_frac=float(np.isfinite(speeds['speed_all']).mean()),
+                still_removed=n_removed, water_samples=n_water, still_points=int(still.any(0).sum()),
+                seg_mask=bool(v['mask']), seg_horizon=bool(seg_h), seg_dropped=n_seg_drop,
+                seg_line_frac=float(np.isfinite(lines).all(1).mean()) if lines is not None else None,
                 horizon_pitch_deg=[round(float(np.min(hp)), 2), round(float(np.max(hp)), 2)],
                 horizon_roll_deg=[round(float(np.min(hr)), 2), round(float(np.max(hr)), 2)],
                 static_frac=float(static.mean()),
@@ -340,9 +469,10 @@ def _render_job(args):
 
 
 def _job(args):
-    root, clip, pose_paths, out_path, focal_scale, rot_path = args
+    root, clip, pose_paths, out_path, focal_scale, rot_path, drop_still, seg_path, variants = args
     try:
-        return process_clip(root, clip, pose_paths, out_path, focal_scale=focal_scale, rot_path=rot_path)
+        return process_clip(root, clip, pose_paths, out_path, focal_scale=focal_scale, rot_path=rot_path,
+                            drop_still=drop_still, seg_path=seg_path, variants=variants)
     except Exception as exc:
         return dict(key=clip['key'], camera_mode=clip['camera_mode'], error=str(exc)[:300])
 
@@ -362,6 +492,11 @@ def main(argv=None):
                     help='multiply the released fx, fy (must match the run_dpvo.py --focal-scale of --poses)')
     ap.add_argument('--rot-poses', type=Path,
                     help='take the rotations from this run dir instead (e.g. Pi3X), slerp-resampled to the DPVO frames')
+    ap.add_argument('--drop-still', action='store_true',
+                    help='drop water samples whose flow stays far below their row for >= STILL_RUN pairs (droplets)')
+    ap.add_argument('--seg', type=Path, help='seg_run.py output dir (PanSR masks) for --variant')
+    ap.add_argument('--variant', nargs='+', help="NAME=FLAGS with FLAGS from mask,horizon,still joined by '+': "
+                                               "one flow computation, outputs <output>-NAME (needs --seg)")
     ap.add_argument('--render', action='store_true',
                     help='only render a geometry check (3 frames with horizon/water) per processed clip')
     args = ap.parse_args(argv)
@@ -379,15 +514,32 @@ def main(argv=None):
             for k in ex.map(_render_job, jobs):
                 print('rendered', k, flush=True)
         return 0
+    variants = None
+    if args.variant:
+        if args.seg is None:
+            ap.error('--variant needs --seg')
+        variants = []
+        for spec in args.variant:
+            name, flags = spec.split('=', 1)
+            fl = set(flags.split('+')) - {''}
+            if fl - {'mask', 'horizon', 'still', 'none'}:
+                ap.error(f'unknown variant flags in {spec}')
+            variants.append((args.output.parent / f'{args.output.name}-{name}', dict(
+                mask='mask' in fl, horizon='horizon' in fl, still='still' in fl)))
     jobs = []
     for c in clips:
         out = args.output / 'speed' / f"{c['key']}.npz"
-        if out.is_file() and not args.overwrite:
+        vouts = [(d / 'speed' / f"{c['key']}.npz", v) for d, v in variants] if variants else None
+        if (all(o.is_file() for o, _ in vouts) if vouts else out.is_file()) and not args.overwrite:
             continue
+        seg = args.seg / f"{c['key']}.npz" if args.seg else None
+        if vouts and not seg.is_file():
+            continue                                  # not segmented (yet)
         rot = args.rot_poses / 'poses' / f"{c['key']}.npz" if args.rot_poses else None
         if rot is not None and not rot.is_file():
             continue                                  # no rotation source for this clip
-        jobs.append((root, c, [d / 'poses' / f"{c['key']}.npz" for d in args.poses], out, args.focal_scale, rot))
+        jobs.append((root, c, [d / 'poses' / f"{c['key']}.npz" for d in args.poses], out, args.focal_scale, rot,
+                     args.drop_still, seg, vouts))
     print(f'{len(jobs)} clips to process ({len(clips) - len(jobs)} already done)', flush=True)
     summary_path = args.output / 'flow_speed_summary.json'
     summary = {}
