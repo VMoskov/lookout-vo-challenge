@@ -91,17 +91,19 @@ def main(argv=None):
                     help='experiment: multiply the released fx, fy by this (e.g. a zoomed camera)')
     ap.add_argument('--clahe', action='store_true',
                     help='CLAHE-equalise thermal (flir-IR) clips before DPVO; see thermal.py')
+    ap.add_argument('--crop-bottom', type=float, default=0.0,
+                    help='drop this fraction of the frame at the bottom (own bow/deck) before DPVO; see thermal.py')
     args = ap.parse_args(argv)
 
     from tracking import describe_environment, track  # imports DPVO lazily inside track()
-    if args.clahe:
+    if args.clahe or args.crop_bottom:
         import thermal
-        thermal.install()  # track() now decodes through thermal.clahe_stream_worker
+        thermal.install(clahe=args.clahe, crop=args.crop_bottom)  # track() now decodes through thermal.clahe_stream_worker
     if args.dpvo_diag:
         install_dpvo_diagnostics()
     if args.inpaint_rects:
-        if args.clahe:
-            ap.error('--inpaint-rects and --clahe both replace the decoder; use one')
+        if args.clahe or args.crop_bottom:
+            ap.error('--inpaint-rects and --clahe/--crop-bottom both replace the decoder; use one')
         import overlay
         overlay.install(json.loads(args.inpaint_rects))
     if args.patch_strategy != 'RANDOM':
@@ -137,6 +139,8 @@ def main(argv=None):
         settings['patch_strategy'] = args.patch_strategy
     if args.focal_scale != 1.0:  # key only when used, so older runs still resume
         settings['focal_scale'] = args.focal_scale
+    if args.crop_bottom:  # key only when used, so older runs still resume
+        settings['crop_bottom'] = args.crop_bottom
     if args.clahe:  # key only when on, so runs started before this option still resume
         settings['clahe'] = dict(modes=list(thermal.THERMAL_MODES), clip_limit=thermal.CLAHE_CLIP_LIMIT,
                                  tile_grid=list(thermal.CLAHE_TILE_GRID))

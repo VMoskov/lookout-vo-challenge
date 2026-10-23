@@ -55,7 +55,7 @@ def shifted_frames(pre, frame_times, phase):
         cap.release()
 
 
-def keyframes(root, clip, fps, phase=0.0):
+def keyframes(root, clip, fps, phase=0.0, crop=0.0):
     from preprocessing import ClipPreprocessor
     t = load_timestamps(root, clip)
     pre = ClipPreprocessor(str(asset_path(root, clip['video'])), clip['camera_mode'], fps,
@@ -65,6 +65,8 @@ def keyframes(root, clip, fps, phase=0.0):
     for _, img, _, pts, d in (shifted_frames(pre, t, phase) if phase else pre.frames_with_time()):
         if clahe is not None:
             img = thermal.apply_clahe(img, clahe)
+        if crop:
+            img = thermal.crop_bottom(img, crop, multiple=1)
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
         nh = round(h * VGGT_WIDTH / w)
@@ -102,13 +104,13 @@ def project_so3(M):
     return U @ D @ Vt
 
 
-def process_clip(model, root, clip, fps, window, overlap, run=run_window, inject_scale=None, phase=0.0):
+def process_clip(model, root, clip, fps, window, overlap, run=run_window, inject_scale=None, phase=0.0, crop=0.0):
     """Chained poses and per-window FOV of one clip. `run(model, frames, K)` returns one window's
     camera-to-world rotations, centres and fx; with `inject_scale` it gets the released keyframe
     intrinsics with fx, fy scaled by it (else K=None). `phase` (0..1) shifts the keyframes by that
-    fraction of the keyframe interval."""
+    fraction of the keyframe interval; `crop` drops that fraction of each frame at the bottom."""
     t0 = time.time()
-    frames, times, dec, nominal, n_frames, K = keyframes(root, clip, fps, phase)
+    frames, times, dec, nominal, n_frames, K = keyframes(root, clip, fps, phase, crop)
     K = np.diag([inject_scale, inject_scale, 1.0]) @ K if inject_scale is not None else None
     n = len(frames)
     R = np.full((n, 3, 3), np.nan)
@@ -158,6 +160,7 @@ def build_parser(description):
     ap.add_argument('--window', type=int, default=24)
     ap.add_argument('--overlap', type=int, default=4)
     ap.add_argument('--phase', type=float, default=0.0, help='shift keyframes by this fraction of their interval')
+    ap.add_argument('--crops', type=Path, help='JSON {clip: fraction}: drop that fraction of each frame at the bottom')
     return ap
 
 
@@ -170,13 +173,17 @@ def run_clips(model, args, run=run_window, inject_scale=None, name='vggt'):
     out.mkdir(parents=True, exist_ok=True)
     summ_path = args.output / f'{name}_summary.json'
     summary = json.loads(summ_path.read_text()) if summ_path.is_file() else {}
+    crops = json.loads(args.crops.read_text()) if args.crops else {}
     for c in clips:
         if (out / f"{c['key']}.npz").is_file():
             print(c['key'], 'done, skipping', flush=True)
             continue
         try:
+            crop = float(crops.get(c['key'], 0.0))
             res, secs = process_clip(model, root, c, args.keyframe_fps, args.window, args.overlap, run, inject_scale,
-                                     args.phase)
+                                     args.phase, crop)
+            if crop:
+                res['crop_bottom'] = np.float64(crop)
             if args.phase:
                 res['keyframe_phase'] = np.float64(args.phase)
             if inject_scale is not None:
