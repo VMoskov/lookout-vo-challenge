@@ -208,8 +208,22 @@ def best_pose_run(pose_paths):
     return z, path
 
 
-def process_clip(root, clip, pose_paths, out_path, target_fps=8.0, focal_scale=1.0):
-    """Flow + water-plane speed for one clip. Returns a summary dict."""
+def resampled_rotations(path, times):
+    """Camera-to-world rotations of another heading source (e.g. Pi3X keyframes) slerp-interpolated to
+    `times`; frames outside its pose span are marked not ok. Returns (R [n,3,3], ok [n])."""
+    from scipy.spatial.transform import Rotation, Slerp
+    z = load_pose_npz(path)
+    good = np.isfinite(z['poses']).all(1)
+    t, q = z['times'][good], z['poses'][good, 3:7]
+    ok = (times >= t[0]) & (times <= t[-1])
+    R = np.tile(np.eye(3), (len(times), 1, 1))
+    R[ok] = Slerp(t, Rotation.from_quat(q))(times[ok]).as_matrix()
+    return R, ok
+
+
+def process_clip(root, clip, pose_paths, out_path, target_fps=8.0, focal_scale=1.0, rot_path=None):
+    """Flow + water-plane speed for one clip. Returns a summary dict. With `rot_path` the rotations
+    (derotation, up) come from that run (resampled to the DPVO frames) instead of DPVO."""
     t0 = time.time()
     frames, dec, times, K = clip_frames(root, clip, target_fps, focal_scale)
     t_dec = time.time() - t0
@@ -219,6 +233,9 @@ def process_clip(root, clip, pose_paths, out_path, target_fps=8.0, focal_scale=1
     R = quat_to_rotmat(np.nan_to_num(z['poses'][:, 3:7], nan=0.0) + np.where(
         np.isfinite(z['poses'][:, 3:7]).all(1, keepdims=True), 0, [0, 0, 0, 1]))
     pose_ok = np.isfinite(z['poses']).all(1)
+    if rot_path is not None:
+        R, pose_ok = resampled_rotations(rot_path, times)
+        pose_used = f'{pose_used} (rotations: {rot_path})'
     U = estimate_up(R[pose_ok])                     # world up (DPVO frame), as for the heading
     ups = np.einsum('nji,j->ni', R, U)              # camera-frame up per frame: R^T U
 
@@ -323,9 +340,9 @@ def _render_job(args):
 
 
 def _job(args):
-    root, clip, pose_paths, out_path, focal_scale = args
+    root, clip, pose_paths, out_path, focal_scale, rot_path = args
     try:
-        return process_clip(root, clip, pose_paths, out_path, focal_scale=focal_scale)
+        return process_clip(root, clip, pose_paths, out_path, focal_scale=focal_scale, rot_path=rot_path)
     except Exception as exc:
         return dict(key=clip['key'], camera_mode=clip['camera_mode'], error=str(exc)[:300])
 
@@ -343,6 +360,8 @@ def main(argv=None):
     ap.add_argument('--overwrite', action='store_true')
     ap.add_argument('--focal-scale', type=float, default=1.0,
                     help='multiply the released fx, fy (must match the run_dpvo.py --focal-scale of --poses)')
+    ap.add_argument('--rot-poses', type=Path,
+                    help='take the rotations from this run dir instead (e.g. Pi3X), slerp-resampled to the DPVO frames')
     ap.add_argument('--render', action='store_true',
                     help='only render a geometry check (3 frames with horizon/water) per processed clip')
     args = ap.parse_args(argv)
@@ -365,7 +384,10 @@ def main(argv=None):
         out = args.output / 'speed' / f"{c['key']}.npz"
         if out.is_file() and not args.overwrite:
             continue
-        jobs.append((root, c, [d / 'poses' / f"{c['key']}.npz" for d in args.poses], out, args.focal_scale))
+        rot = args.rot_poses / 'poses' / f"{c['key']}.npz" if args.rot_poses else None
+        if rot is not None and not rot.is_file():
+            continue                                  # no rotation source for this clip
+        jobs.append((root, c, [d / 'poses' / f"{c['key']}.npz" for d in args.poses], out, args.focal_scale, rot))
     print(f'{len(jobs)} clips to process ({len(clips) - len(jobs)} already done)', flush=True)
     summary_path = args.output / 'flow_speed_summary.json'
     summary = {}
