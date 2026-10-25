@@ -245,6 +245,7 @@ def still_runs(flows, gy_rows, rel=STILL_REL, run=STILL_RUN):
 
 
 SEG_WATER = 10                # LaRS class id of water in seg_run.py masks
+SEG_SKY = 11
 SEG_MIN_COLS = 0.3            # segmentation horizon: fit a line only if >= this fraction of columns has water
 SEG_SIGMA_S = 1.0             # ... then median over 9 segmented frames and Gaussian smoothing in time
 
@@ -264,15 +265,22 @@ def seg_water_points(seg, dec, p):
     return m[:, yi, xi][nearest] == SEG_WATER
 
 
-def seg_horizon_lines(seg, H):
+def seg_horizon_lines(seg, H, sky_only=False):
     """Per segmented frame, a robust line (slope, intercept) through the top edge of the water region
     (water/sky or water/shore boundary): least squares, then 3 rounds dropping residuals beyond
-    max(3 MAD, 2 px). NaN where too few columns have water or the fit keeps < half of them."""
+    max(3 MAD, 2 px). NaN where too few columns have water or the fit keeps < half of them.
+    `sky_only`: use only columns where the pixel just above the water edge is sky (the water/sky
+    boundary = the true horizon; skips columns where water meets shore or obstacles)."""
     W = seg['water_top'].shape[1]
     xs = np.arange(W, dtype=float)
     out = np.full((len(seg['water_top']), 2), np.nan)
+    q = int(seg['quarter'])
+    qcols = np.minimum(np.arange(W) // q, seg['masks'].shape[2] - 1)
     for i, top in enumerate(seg['water_top']):
         ok = (top > 0) & (top < H - 1)
+        if sky_only:
+            above = seg['masks'][i, np.clip(top // q - 1, 0, None), qcols]
+            ok &= above == SEG_SKY
         if ok.mean() < SEG_MIN_COLS:
             continue
         x, y = xs[ok], top[ok].astype(float)
@@ -286,12 +294,12 @@ def seg_horizon_lines(seg, H):
     return out
 
 
-def seg_horizon_ups(seg, times, K, W, H):
+def seg_horizon_ups(seg, times, K, W, H, sky_only=False):
     """Camera-frame up vector per frame whose horizon (rays with u.r = 0) is the segmentation line,
     median-filtered over 9 segmented frames and smoothed in time (SEG_SIGMA_S). None if no frame
     has a line. The line is the visible water edge: the true horizon at open sea, the shoreline
     (below the horizon) in harbours."""
-    lines = seg_horizon_lines(seg, H)
+    lines = seg_horizon_lines(seg, H, sky_only)
     ok = np.isfinite(lines).all(1)
     if ok.sum() < 3:
         return None, lines
@@ -360,10 +368,13 @@ def process_clip(root, clip, pose_paths, out_path, target_fps=8.0, focal_scale=1
         raise FileNotFoundError('segmentation file needed for this variant')
     segwater = seg_water_points(seg, dec, p) if seg is not None else None
     useg, lines = seg_horizon_ups(seg, times, K, W, H) if seg is not None else (None, None)
+    usky, lines_sky = (seg_horizon_ups(seg, times, K, W, H, sky_only=True)
+                       if seg is not None and any(v.get('skyhorizon') for _, v in variants) else (None, None))
     still_all = still_runs(flows, gy.ravel()) if any(v['still'] for _, v in variants) else None
     summary = None
     for vpath, v in variants:
-        summary = _fit_variant(vpath, v, clip, flows, p, rays, static, still_all, segwater, useg, lines, R, ups, hp, hr,
+        uh, lh = (usky, lines_sky) if v.get('skyhorizon') else (useg, lines)
+        summary = _fit_variant(vpath, v, clip, flows, p, rays, static, still_all, segwater, uh, lh, R, ups, hp, hr,
                                htable, pose_ok, times, dec, K, focal_scale, n, pose_used, t0, t_dec, t_flow)
     return summary
 
@@ -374,7 +385,11 @@ def _fit_variant(out_path, v, clip, flows, p, rays, static, still_all, segwater,
     drop_still = v['still']
     still = still_all if drop_still else np.zeros((n - 1, len(p)), bool)
     n_water = n_removed = n_seg_drop = 0
-    seg_h = v['horizon'] and useg is not None
+    seg_h = (v['horizon'] or v.get('skyhorizon', False)) and useg is not None
+    fixed = v.get('fixed', False)
+    n_band = {b: np.zeros(n - 1, np.int32) for b in ('near', 'far')}
+    dpvo_up = np.einsum('kij,kj->ki', np.stack([correction(a, b) for a, b in zip(hp, hr)]), ups)
+    dpvo_up /= np.linalg.norm(dpvo_up, axis=1, keepdims=True)
 
     # 3-5. per pair: water pixels, near/far bands, robust fit
     keys = ('a_all', 'b_all', 'rmse_all', 'n_all', 'a_near', 'b_near', 'rmse_near', 'n_near',
@@ -386,19 +401,23 @@ def _fit_variant(out_path, v, clip, flows, p, rays, static, still_all, segwater,
         u = useg[k] if seg_h else correction(hp[k], hr[k]) @ ups[k]
         u /= np.linalg.norm(u)
         water, s = water_region(rays, u, static)
+        split = np.median(s[water]) if fixed and water.any() else None   # geometric bands, before masking
         if v['mask']:
             n_seg_drop += int((water & ~segwater[k]).sum())
             water &= segwater[k]
         n_water += int(water.sum())
         n_removed += int((water & still[k]).sum())
         water &= ~still[k]
-        if water.sum() < 2 * MIN_BAND_PIXELS:
+        if water.sum() < (MIN_BAND_PIXELS if fixed else 2 * MIN_BAND_PIXELS):
             continue
         R_ji = R[k + 1].T @ R[k]
         fwd = np.array([0, 0, 1.0]) - u[2] * u      # camera forward, flattened
         e1 = fwd / np.linalg.norm(fwd)
         e2 = np.cross(e1, u)                        # right (camera +x side)
-        split = np.median(s[water])
+        if split is None:
+            split = np.median(s[water])
+        if fixed:
+            n_band['near'][k], n_band['far'][k] = int((water & (s >= split)).sum()), int((water & (s < split)).sum())
         for band, sel in (('all', water), ('near', water & (s >= split)), ('far', water & (s < split))):
             if sel.sum() < MIN_BAND_PIXELS:
                 continue
@@ -416,7 +435,8 @@ def _fit_variant(out_path, v, clip, flows, p, rays, static, still_all, segwater,
              drop_still=drop_still, still_removed=np.int64(n_removed), water_samples=np.int64(n_water),
              still_points=np.int64(still.any(0).sum()), seg_mask=bool(v['mask']), seg_horizon=bool(seg_h),
              seg_dropped=np.int64(n_seg_drop), **({'seg_lines': lines} if lines is not None else {}),
-             **({'seg_up': useg} if seg_h else {}))
+             **({'seg_up': useg} if seg_h else {}), dpvo_up=dpvo_up,
+             **({'n_band_near': n_band['near'], 'n_band_far': n_band['far']} if fixed else {}))
     return dict(key=clip['key'], camera_mode=clip['camera_mode'], n_pairs=n - 1, poses=pose_used,
                 focal_scale=focal_scale,
                 valid_frac=float(np.isfinite(speeds['speed_all']).mean()),
@@ -495,7 +515,7 @@ def main(argv=None):
     ap.add_argument('--drop-still', action='store_true',
                     help='drop water samples whose flow stays far below their row for >= STILL_RUN pairs (droplets)')
     ap.add_argument('--seg', type=Path, help='seg_run.py output dir (PanSR masks) for --variant')
-    ap.add_argument('--variant', nargs='+', help="NAME=FLAGS with FLAGS from mask,horizon,still joined by '+': "
+    ap.add_argument('--variant', nargs='+', help="NAME=FLAGS with FLAGS from mask,horizon,skyhorizon,fixed,still joined by '+': "
                                                "one flow computation, outputs <output>-NAME (needs --seg)")
     ap.add_argument('--render', action='store_true',
                     help='only render a geometry check (3 frames with horizon/water) per processed clip')
@@ -522,10 +542,11 @@ def main(argv=None):
         for spec in args.variant:
             name, flags = spec.split('=', 1)
             fl = set(flags.split('+')) - {''}
-            if fl - {'mask', 'horizon', 'still', 'none'}:
+            if fl - {'mask', 'horizon', 'skyhorizon', 'fixed', 'still', 'none'}:
                 ap.error(f'unknown variant flags in {spec}')
             variants.append((args.output.parent / f'{args.output.name}-{name}', dict(
-                mask='mask' in fl, horizon='horizon' in fl, still='still' in fl)))
+                mask='mask' in fl, horizon='horizon' in fl, still='still' in fl, skyhorizon='skyhorizon' in fl,
+                fixed='fixed' in fl)))
     jobs = []
     for c in clips:
         out = args.output / 'speed' / f"{c['key']}.npz"

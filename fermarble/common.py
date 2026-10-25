@@ -544,13 +544,20 @@ def speed_variation(speed):
     return float(speed.std() / speed.mean()), float(speed.max() / med) if med > 0 else float('inf')
 
 
-def flow_reliable_speed(d, agree_tol, side_max=NO_LIMIT, drop_backward=False):
+def flow_reliable_speed(d, agree_tol, side_max=NO_LIMIT, drop_backward=False, band_min=None, window_s=8.0):
     """Stage 1 of filter_flow_speed: normalised near/far bands, agreement test, geometric mean.
     A pair is also unreliable when its fitted motion is more than side_max sideways
     (|sideways| / |displacement|) or, with drop_backward, points backwards: a boat under way
     moves forwards, so these flag scenes the water-plane model does not explain (harbour
     clutter, docking, side-looking views).
+    With `band_min` (flow_speed.py 'fixed' bands, which store the water pixels per band as
+    n_band_near / n_band_far): a band counts only with >= band_min water pixels. Pairs with both
+    bands use the agreement test; pairs with one band (e.g. shore covers the far band) are kept
+    only when that band's normalised speed is within agree_tol / 2 of the window_s rolling median
+    of the two-band speeds (stricter, no extra parameter).
     Returns (t_mid, speed or NaN where unreliable, reliable fraction, n usable pairs)."""
+    if band_min is not None and 'n_band_near' in d:
+        return _flow_reliable_banded(d, agree_tol, side_max, drop_backward, band_min, window_s)
     near = np.asarray(d['speed_near'], float)
     far = np.asarray(d['speed_far'], float)
     t = np.asarray(d['t_mid'], float)
@@ -568,6 +575,34 @@ def flow_reliable_speed(d, agree_tol, side_max=NO_LIMIT, drop_backward=False):
             if drop_backward:
                 agree &= a > 0
     return t, np.where(agree, np.sqrt(nn * ff), np.nan), float(agree.mean()), int(agree.sum())
+
+
+def _flow_reliable_banded(d, agree_tol, side_max, drop_backward, band_min, window_s):
+    near = np.asarray(d['speed_near'], float)
+    far = np.asarray(d['speed_far'], float)
+    t = np.asarray(d['t_mid'], float)
+    has_n = np.isfinite(near) & (near > 0) & (np.asarray(d['n_band_near']) >= band_min)
+    has_f = np.isfinite(far) & (far > 0) & (np.asarray(d['n_band_far']) >= band_min)
+    if has_n.sum() < 10 and has_f.sum() < 10:
+        return t, np.full(len(t), np.nan), 0.0, 0
+    nn = near / np.median(near[has_n]) if has_n.sum() >= 10 else np.full(len(t), np.nan)
+    ff = far / np.median(far[has_f]) if has_f.sum() >= 10 else np.full(len(t), np.nan)
+    a, b = np.asarray(d['a_all'], float), np.asarray(d['b_all'], float)
+    motion_ok = np.ones(len(t), bool)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        if side_max < 1.0:
+            motion_ok &= np.abs(b) <= side_max * np.hypot(a, b)
+        if drop_backward:
+            motion_ok &= a > 0
+        two = has_n & has_f & motion_ok & (np.abs(np.log(nn / ff)) <= agree_tol)
+    v = np.where(two, np.sqrt(nn * ff), np.nan)
+    rm = rolling_median(t, v, window_s)
+    single = np.where(has_n & ~has_f, nn, np.where(has_f & ~has_n, ff, np.nan))
+    with np.errstate(divide='ignore', invalid='ignore'):
+        keep = np.isfinite(single) & np.isfinite(rm) & motion_ok & (np.abs(np.log(single / rm)) <= agree_tol / 2)
+    v = np.where(keep, single, v)
+    ok = np.isfinite(v)
+    return t, v, float(ok.mean()), int(ok.sum())
 
 
 def flow_speed_from_reliable(t, v, frame_times, window_s, clamp_lo, clamp_hi, smoothed=None):
@@ -599,7 +634,8 @@ def filter_flow_speed(d, frame_times, params=None):
     if jump > p['horizon_jump_max']:
         return np.ones(len(frame_times)), dict(speed_fallback='horizon', horizon_jump=jump, reliable_frac=np.nan,
                                                fallback_frac=1.0)
-    t, v, rel_frac, n_rel = flow_reliable_speed(d, p['agree_tol'], p['side_max'], p['drop_backward'])
+    t, v, rel_frac, n_rel = flow_reliable_speed(d, p['agree_tol'], p['side_max'], p['drop_backward'],
+                                                p.get('band_min'), p['window_s'])
     if rel_frac < p['min_reliable_frac'] or n_rel < 10:
         return np.ones(len(frame_times)), dict(speed_fallback='clip', reliable_frac=rel_frac, fallback_frac=1.0)
     speed, filled = flow_speed_from_reliable(t, v, frame_times, p['window_s'], p['clamp_lo'], p['clamp_hi'])

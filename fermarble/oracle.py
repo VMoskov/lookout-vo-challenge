@@ -20,6 +20,7 @@ Optionally scores a real predictions directory with starter evaluate.evaluate_cl
 """
 from __future__ import annotations
 import argparse
+import json
 import csv
 from pathlib import Path
 
@@ -1198,6 +1199,58 @@ def focal_lower_bound(clips, runs):
     return '\n'.join(L), rows
 
 
+GATE_GRID = dict(hv=['sa', 'sb'], N=[40, 80, 160, 320], T=[10.0, 20.0, 40.0, 80.0, NO_LIMIT], D=[1.0, 2.0, 4.0, NO_LIMIT],
+                 X=[0.02, 0.05, 0.1, 0.2, 1.0], Y=[0.0, 0.3, 0.5, 0.7], Z=[5.0, 10.0, 20.0, 40.0, NO_LIMIT])
+GATE_YAW = {'wide': 0.95}     # kwide: rotation-scale calibration of the Pi3X heading
+
+
+def _gate_clip(args):
+    """One clip: GT-free gate features (gated_flow.clip_features) + drift of the old speed and of every
+    candidate new speed, with the kwide heading (Pi3X x GATE_YAW)."""
+    from gated_flow import SOURCES, clip_features
+    root, clip, old_dir, new_prefix, pi3x_dir = args
+    k = clip['key']
+    data = speed_clip_data(root, clip, None, [pi3x_dir / 'poses' / f'{k}.npz'])
+    head = data['med3'] * GATE_YAW.get(clip['camera_mode'], 1.0) if data['med3'] is not None else None
+    f = clip_features(old_dir / 'speed' / f'{k}.npz', {s: Path(f'{new_prefix}-{s}') / 'speed' / f'{k}.npz' for s in SOURCES},
+                      data['frame_t'], GATE_GRID['N'])
+    old = _score_speed(data, head, f['old_speed'])
+    for s in f['src'].values():
+        for c in s['n'].values():
+            c['score'] = _score_speed(data, head, c['speed']) if c['fallback'] == 'none' else old
+            del c['speed']
+    del f['old_speed'], f['raw_old']
+    return k, clip['split'], old, f
+
+
+def gate_tune(root, clips, old_dir, new_prefix, pi3x_dir, workers=8, grid=None):
+    """Fit the gated-flow parameters (gated_flow.py) on the TRAIN clips among `clips`: minimise the
+    mean drift; ties -> fewer clips switching to the new flow. `grid` overrides GATE_GRID entries
+    (e.g. hard constraints as single values). Returns (best, rows, per-clip table)."""
+    from concurrent.futures import ProcessPoolExecutor
+    import itertools
+    from gated_flow import decide
+    with ProcessPoolExecutor(workers) as ex:
+        res = list(ex.map(_gate_clip, [(root, c, old_dir, new_prefix, pi3x_dir) for c in clips]))
+    grid = dict(GATE_GRID, **(grid or {}))
+    order = list(grid)
+    rows = []
+    for combo in itertools.product(*(grid[k] for k in order)):
+        g = dict(zip(order, combo))
+        sc = {'train': [], 'val': []}
+        n_new = 0
+        for k, split, old, f in res:
+            choice, _ = decide(f, g)
+            sc[split].append(old if choice == 'old' else f['src'][choice]['n'][g['N']]['score'])
+            n_new += split == 'train' and choice != 'old'
+        rows.append(dict(g, train=float(np.mean(sc['train'])), val=float(np.mean(sc['val'])) if sc['val'] else np.nan,
+                         train_new=n_new))
+    rows.sort(key=lambda r: (round(r['train'], 6), r['train_new']))
+    base = dict(train=float(np.mean([o for _, s, o, _ in res if s == 'train'])),
+                val=float(np.mean([o for _, s, o, _ in res if s == 'val'])))
+    return rows[0], rows, res, base
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--dataset', type=Path, default=DEFAULT_DATASET)
@@ -1225,6 +1278,9 @@ def main(argv=None):
     ap.add_argument('--focal-diag', nargs='*', default=[], help='focal report: SCALE=DIR diag runs (run_dpvo --dpvo-diag)')
     ap.add_argument('--focal-lower-bound', nargs='+',
                     help='LABEL=PREDDIR (scored by evaluate.py), first = x1.0 base: per-clip best focal (oracle)')
+    ap.add_argument('--gate-tune', nargs=3, metavar=('OLD_FLOW_DIR', 'NEW_PREFIX', 'PI3X_DIR'),
+                    help='fit gated_flow.py parameters on the TRAIN clips (wide + flir-VIS) of the selection')
+    ap.add_argument('--gate-grid', type=Path, help='JSON overriding GATE_GRID entries for --gate-tune (constraints)')
     ap.add_argument('--worst', type=int, default=0,
                     help='also list the N worst clips, classify speed/heading/DPVO failure (needs --heading-diff)')
     args = ap.parse_args(argv)
@@ -1272,6 +1328,30 @@ def main(argv=None):
         write_csv(args.output / 'compare_runs.csv', rows)
         (args.output / 'compare_runs.txt').write_text(text + '\n')
         print(text)
+        return 0
+    if args.gate_tune:
+        clips = [c for c in selected if c['camera_mode'] in ('wide', 'flir-VIS')]
+        grid = json.loads(args.gate_grid.read_text()) if args.gate_grid else None
+        grid = {k: [NO_LIMIT if x is None else x for x in v] for k, v in (grid or {}).items()}
+        best, rows, res, base = gate_tune(root, clips, Path(args.gate_tune[0]), args.gate_tune[1], Path(args.gate_tune[2]),
+                                          args.workers, grid)
+        if grid and len(grid.get('hv', [])) > 1:      # best per horizon type, for the report
+            for hv in grid['hv']:
+                r = next(r for r in rows if r['hv'] == hv)
+                print(f"best with hv={hv}: " + str({k: (round(v, 3) if isinstance(v, float) else v) for k, v in r.items()}))
+        args.output.mkdir(parents=True, exist_ok=True)
+        write_json(args.output / 'gate.json', {k: best[k] for k in GATE_GRID})
+        write_csv(args.output / 'gate_tune.csv', rows[:2000])
+        nonan = lambda o: ({k: nonan(v) for k, v in o.items()} if isinstance(o, dict) else
+                           None if isinstance(o, float) and not np.isfinite(o) else o)
+        write_json(args.output / 'gate_clips.json', [nonan(dict(key=k, split=s, old=o, rel_old=f['rel_old'], old_fallback=f['old_fallback'],
+                                                         src={n: dict(row_diff=v['row_diff'], tilt_diff=v['tilt_diff'],
+                                                                      n={str(m): c for m, c in v['n'].items()})
+                                                              for n, v in f['src'].items()})) for k, s, o, f in res])
+        print(f"old speed (kwide): train {base['train']:.3f} val {base['val']:.3f} | best gate {dict((k, best[k]) for k in GATE_GRID)}: "
+              f"train {best['train']:.3f} val {best['val']:.3f}, {best['train_new']} train clips switch")
+        for r in rows[:8]:
+            print({k: (round(v, 3) if isinstance(v, float) else v) for k, v in r.items()})
         return 0
     if args.focal_lower_bound:
         runs = {kv.split('=', 1)[0]: Path(kv.split('=', 1)[1]) for kv in args.focal_lower_bound}
