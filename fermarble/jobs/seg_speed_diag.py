@@ -82,13 +82,14 @@ def main():
     from gated_flow import longest_gap
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--decisions', type=Path, help='gated decisions.json: check the clips that use the new flow')
+    ap.add_argument('--clips', help='comma-separated clips to check (overrides the default list)')
     ap.add_argument('--new-dir', type=Path, default=Path('runs/flow-seg-test-c'))
     ap.add_argument('--params', type=Path, default=E / 'params_c.json')
     ap.add_argument('--output', type=Path, default=E / 'test_speed_diag')
     args = ap.parse_args()
     v3a = json.loads(Path('runs/speed-tune3/params_v3a_no_hjump.json').read_text())
     pc = json.loads(args.params.read_text())
-    keys = CLIPS
+    keys = args.clips or CLIPS
     if args.decisions:
         dec = json.loads(args.decisions.read_text())
         keys = ','.join(k for k, d in dec.items() if d['speed_source'] != 'old')

@@ -134,6 +134,37 @@ def integrate_planar(frame_times, heading, speed):
     return np.column_stack([xy, np.zeros(len(xy))])
 
 
+def apply_motion_priors(frame_times, positions, max_yaw_deg_s=None, max_accel=None):
+    """Physical priors on a predicted planar path, applied to its per-step displacements (so the
+    result is exactly the input when no limit is active): the step heading may change by at most
+    max_yaw_deg_s per second, and the step speed by at most max_accel x the clip's median step
+    speed per second (forward and backward limited passes, averaged). None = no limit."""
+    t = np.asarray(frame_times, float)
+    xy = np.asarray(positions, float)[:, :2]
+    steps = np.diff(xy, axis=0)
+    if len(steps) < 3 or (max_yaw_deg_s is None and max_accel is None):
+        return positions
+    dt = np.diff(t)
+    spd = np.linalg.norm(steps, axis=1) / dt
+    hd = np.unwrap(np.arctan2(steps[:, 0], steps[:, 1]))
+    dts = 0.5 * (dt[1:] + dt[:-1])                      # time between step centres
+    if max_yaw_deg_s is not None:
+        lim = np.radians(max_yaw_deg_s) * dts
+        hd = hd[0] + np.concatenate([[0.0], np.cumsum(np.clip(np.diff(hd), -lim, lim))])
+    if max_accel is not None:
+        lim = max_accel * np.median(spd) * dts
+        fwd, bwd = spd.copy(), spd.copy()
+        for i in range(1, len(spd)):
+            fwd[i] = np.clip(spd[i], fwd[i - 1] - lim[i - 1], fwd[i - 1] + lim[i - 1])
+        for i in range(len(spd) - 2, -1, -1):
+            bwd[i] = np.clip(spd[i], bwd[i + 1] - lim[i], bwd[i + 1] + lim[i])
+        spd = 0.5 * (fwd + bwd)
+    new = (spd * dt)[:, None] * np.column_stack([np.sin(hd), np.cos(hd)])
+    out = np.array(positions, float)
+    out[1:, :2] = xy[0] + np.cumsum(new, axis=0)
+    return out
+
+
 def straight_line(frame_times):
     """Constant-velocity straight line at bearing 0 (+y): the always-valid fallback prediction."""
     t = np.asarray(frame_times, float)

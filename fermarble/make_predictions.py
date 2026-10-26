@@ -21,7 +21,7 @@ from common import (DEFAULT_DATASET, SMOOTH_SIGMA_S, heading_constant_speed, loa
                     filter_flow_speed, load_pose_npz, load_timestamps, multi_run_heading_constant_speed,
                     multi_run_heading, _run_heading, circular_median, heading_divergence_60s, integrate_planar,
                     VGGT_SWITCH_DEG,
-                    finite_fraction, total_turn_deg, pose_speed, heading_change_rms_60s, POSE_SPEED_SIGMA_S, BROKEN_SEED_FINITE, BROKEN_SEED_TURN_DEG,
+                    finite_fraction, total_turn_deg, pose_speed, apply_motion_priors, heading_change_rms_60s, POSE_SPEED_SIGMA_S, BROKEN_SEED_FINITE, BROKEN_SEED_TURN_DEG,
                     prediction_dict, select_clips, validate_prediction, write_json)
 
 
@@ -40,7 +40,7 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, s
                  broken_seed=None, tiebreak_path=None, fm_paths=None, fm_combine=None, vggt_label='vggt',
                  fm_speed_path=None, fm_speed_mode=None, fm_speed_sigma=POSE_SPEED_SIGMA_S,
                  referee_path=None, referee_margin=0.0, referee_label='pi3x', agree_paths=None, agree_rule=None,
-                 yaw_scale=1.0, vggt_sigma=None):
+                 yaw_scale=1.0, vggt_sigma=None, max_yaw=None, max_accel=None, vggt_combine='median'):
     """Returns (prediction dict, info dict) for one clip.
 
     `pose_paths` lists one npz per DPVO run (e.g. per seed); several runs are combined by the
@@ -70,6 +70,8 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, s
     heading-change RMS < D deg), the circular mean of their headings is used. `yaw_scale` multiplies
     the heading change when the --vggt source's heading (after any blend) replaces the median
     (rotation-scale calibration). `vggt_sigma` smooths the --vggt source (default `sigma_s`).
+    `max_yaw` (deg/s) / `max_accel` (x median speed per s) apply physical priors to the final path
+    (common.apply_motion_priors).
     """
     frame_times = load_timestamps(root, clip)
     runs, errors = [], []
@@ -130,8 +132,12 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, s
             h3 = circular_median([multi_run_heading(dpvo_runs, frame_times, sigma_s)[0]] + fm_heads)
             positions = integrate_planar(frame_times, h3, speed if speed is not None else np.ones(len(frame_times)))
             info['method'] += f'+median_of_{1 + len(fm_heads)}'
-        hv = multi_run_heading(vggt_runs, frame_times, vggt_sigma if vggt_sigma is not None else sigma_s)[0] \
-            if vggt_runs else None
+        vs = vggt_sigma if vggt_sigma is not None else sigma_s
+        if vggt_combine == 'mean' and len(vggt_runs) > 1:
+            hs = [x for x in (_run_heading(*r, frame_times, vs)[0] for r in vggt_runs) if x is not None]
+            hv = hs[0] + np.angle(np.mean([np.exp(1j * (x - hs[0])) for x in hs], axis=0)) if hs else None
+        else:
+            hv = multi_run_heading(vggt_runs, frame_times, vs)[0] if vggt_runs else None
         if hv is not None:
             h, _ = multi_run_heading(dpvo_runs, frame_times, sigma_s)
             use_vggt = False
@@ -198,9 +204,21 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, s
         info['pose_errors'] = errors
     if not runs:
         info['reason'] = 'no usable pose file'
+    if max_yaw is not None or max_accel is not None:
+        positions = apply_motion_priors(frame_times, positions, max_yaw, max_accel)
+        info.update(max_yaw_deg_s=max_yaw, max_accel=max_accel)
     pred = prediction_dict(clip['key'], frame_times, positions)
     validate_prediction(pred, clip['key'], frame_times)
     return pred, info
+
+
+def per_mode(spec, mode):
+    """'X' or 'MODE=X,MODE=X' -> float for this camera mode, or None (no limit / mode not listed / 'inf')."""
+    if not spec:
+        return None
+    vals = {'*': spec} if '=' not in spec else dict(kv.split('=') for kv in spec.split(','))
+    v = vals.get(mode, vals.get('*'))
+    return None if v is None or v == 'inf' else float(v)
 
 
 def main(argv=None):
@@ -220,6 +238,8 @@ def main(argv=None):
     ap.add_argument('--speed-modes', default='wide', help='camera modes that use flow speed (others constant)')
     ap.add_argument('--vggt', type=Path, nargs='+',
                     help='vggt_tool.py / pi3_tool.py output dir(s): DPVO/VGGT heading switch; several = their median')
+    ap.add_argument('--vggt-combine', choices=['median', 'mean'], default='median',
+                    help='several --vggt runs: per-frame circular median (default) or circular mean')
     ap.add_argument('--vggt-label', default='vggt', help='name of the --vggt source in the method label')
     ap.add_argument('--fm-speed', type=Path, help='foundation-model run dir: speed from its camera centres')
     ap.add_argument('--fm-speed-mode', choices=['replace', 'fallback'], default='replace')
@@ -240,6 +260,8 @@ def main(argv=None):
     ap.add_argument('--agree-b', type=Path, help='second run dir for --agree-rule (e.g. Pi3X)')
     ap.add_argument('--agree-modes', default='flir-IR', help='camera modes where --agree-rule applies')
     ap.add_argument('--vggt-sigma', type=float, help='heading smoothing sigma (s) for the --vggt source (default --sigma)')
+    ap.add_argument('--max-yaw-rate', help='R or MODE=R,...: limit the path heading rate to R deg/s (physical prior)')
+    ap.add_argument('--max-accel', help='A or MODE=A,...: limit speed change to A x median speed per s (physical prior)')
     ap.add_argument('--yaw-scale', default='1.0',
                     help='K or MODE=K,MODE=K: multiply the --vggt heading change by K (per camera mode)')
     ap.add_argument('--tiebreak', type=Path, help='third heading source run dir (e.g. Pi3X): decides a firing switch')
@@ -289,7 +311,8 @@ def main(argv=None):
                                   [d / 'poses' / f'{key}.npz' for d in (args.agree_a, args.agree_b)]
                                   if agree_rule and clip['camera_mode'] in args.agree_modes.split(',') else None,
                                   agree_rule, yaw_scales.get(clip['camera_mode'], yaw_scales.get('*', 1.0)),
-                                  args.vggt_sigma)
+                                  args.vggt_sigma, per_mode(args.max_yaw_rate, clip['camera_mode']),
+                                  per_mode(args.max_accel, clip['camera_mode']), args.vggt_combine)
         write_json(args.output / 'predictions' / f'{key}.json', pred)
         # JSON cannot hold NaN: a diagnostic that is undefined for a clip is recorded as null
         info = {k: (None if isinstance(v, float) and not np.isfinite(v) else v) for k, v in info.items()}
@@ -305,6 +328,8 @@ def main(argv=None):
                     referee=str(args.referee) if args.referee else None,
                     agree_rule=list(agree_rule) if agree_rule else None,
                     yaw_scale=yaw_scales if args.vggt else None,
+                    vggt_combine=args.vggt_combine if args.vggt and len(args.vggt) > 1 else None,
+                    max_yaw_rate=args.max_yaw_rate, max_accel=args.max_accel,
                     vggt_sigma=args.vggt_sigma if args.vggt else None,
                     agree=[str(args.agree_a), str(args.agree_b)] if agree_rule else None,
                     agree_modes=args.agree_modes if agree_rule else None,
