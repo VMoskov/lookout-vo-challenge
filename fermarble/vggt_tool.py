@@ -55,16 +55,25 @@ def shifted_frames(pre, frame_times, phase):
         cap.release()
 
 
-def keyframes(root, clip, fps, phase=0.0, crop=0.0):
+def keyframes(root, clip, fps, phase=0.0, crop=0.0, mask_path=None):
     from preprocessing import ClipPreprocessor
     t = load_timestamps(root, clip)
     pre = ClipPreprocessor(str(asset_path(root, clip['video'])), clip['camera_mode'], fps,
                            calibration=clip['calibration'], frame_timestamps=t)
     clahe = cv2.createCLAHE(thermal.CLAHE_CLIP_LIMIT, thermal.CLAHE_TILE_GRID) if clip['camera_mode'] in thermal.THERMAL_MODES else None
     imgs, times, dec = [], [], []
+    inpaint = None
+    if mask_path:
+        # mask in active-rect coordinates (any size): to the preprocessed frame = half the active
+        # rect, trimmed at the bottom/right like the starter does
+        x0, y0, x1, y1 = clip['calibration']['active_rect']
+        m = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        inpaint = (cv2.resize(m, ((x1 - x0) // 2, (y1 - y0) // 2), interpolation=cv2.INTER_NEAREST) > 127).astype(np.uint8) * 255
     for _, img, _, pts, d in (shifted_frames(pre, t, phase) if phase else pre.frames_with_time()):
         if clahe is not None:
             img = thermal.apply_clahe(img, clahe)
+        if inpaint is not None:   # same inpainting as the HUD test (overlay.py)
+            img = cv2.inpaint(img, inpaint[:img.shape[0], :img.shape[1]], 5, cv2.INPAINT_TELEA)
         if crop:
             img = thermal.crop_bottom(img, crop, multiple=1)
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -104,13 +113,15 @@ def project_so3(M):
     return U @ D @ Vt
 
 
-def process_clip(model, root, clip, fps, window, overlap, run=run_window, inject_scale=None, phase=0.0, crop=0.0):
+def process_clip(model, root, clip, fps, window, overlap, run=run_window, inject_scale=None, phase=0.0, crop=0.0,
+                 mask_path=None):
     """Chained poses and per-window FOV of one clip. `run(model, frames, K)` returns one window's
     camera-to-world rotations, centres and fx; with `inject_scale` it gets the released keyframe
     intrinsics with fx, fy scaled by it (else K=None). `phase` (0..1) shifts the keyframes by that
-    fraction of the keyframe interval; `crop` drops that fraction of each frame at the bottom."""
+    fraction of the keyframe interval; `crop` drops that fraction of each frame at the bottom;
+    `mask_path` inpaints that mask (static own-boat structure) first."""
     t0 = time.time()
-    frames, times, dec, nominal, n_frames, K = keyframes(root, clip, fps, phase, crop)
+    frames, times, dec, nominal, n_frames, K = keyframes(root, clip, fps, phase, crop, mask_path)
     K = np.diag([inject_scale, inject_scale, 1.0]) @ K if inject_scale is not None else None
     n = len(frames)
     R = np.full((n, 3, 3), np.nan)
@@ -161,6 +172,8 @@ def build_parser(description):
     ap.add_argument('--overlap', type=int, default=4)
     ap.add_argument('--phase', type=float, default=0.0, help='shift keyframes by this fraction of their interval')
     ap.add_argument('--crops', type=Path, help='JSON {clip: fraction}: drop that fraction of each frame at the bottom')
+    ap.add_argument('--edits', type=Path, help='JSON {clip: {"crop": fraction, "mask": png}} (structure_masks.py): '
+                                               'inpaint the mask, then crop; overrides --crops for its clips')
     return ap
 
 
@@ -174,14 +187,18 @@ def run_clips(model, args, run=run_window, inject_scale=None, name='vggt'):
     summ_path = args.output / f'{name}_summary.json'
     summary = json.loads(summ_path.read_text()) if summ_path.is_file() else {}
     crops = json.loads(args.crops.read_text()) if args.crops else {}
+    edits = json.loads(args.edits.read_text()) if args.edits else {}
     for c in clips:
         if (out / f"{c['key']}.npz").is_file():
             print(c['key'], 'done, skipping', flush=True)
             continue
         try:
-            crop = float(crops.get(c['key'], 0.0))
+            ed = edits.get(c['key'], {})
+            crop = float(ed.get('crop', crops.get(c['key'], 0.0)))
             res, secs = process_clip(model, root, c, args.keyframe_fps, args.window, args.overlap, run, inject_scale,
-                                     args.phase, crop)
+                                     args.phase, crop, ed.get('mask'))
+            if ed.get('mask'):
+                res['inpaint_mask'] = np.array(ed['mask'])
             if crop:
                 res['crop_bottom'] = np.float64(crop)
             if args.phase:
