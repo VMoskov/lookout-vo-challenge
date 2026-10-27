@@ -129,7 +129,8 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, s
                 speed = fs
                 speed_info['speed_source'] = 'pose_speed'
         positions, info = multi_run_heading_constant_speed(runs, frame_times, sigma_s, speed=speed)
-        final_h, final_speed = None, speed   # DPVO-only path (heading not kept)
+        final_h, final_speed = (multi_run_heading(runs, frame_times, sigma_s)[0]   # DPVO-only path
+                                if info['method'] != 'straight_line_fallback' else None), speed
         info.update(speed_info)
         fm_heads = [x for x in (_run_heading(*r, frame_times, sigma_s)[0] for r in fm_runs) if x is not None]
         if fm_combine == 'median3' and fm_heads and info['method'] != 'straight_line_fallback':

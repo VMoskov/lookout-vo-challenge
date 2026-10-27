@@ -968,6 +968,36 @@ def _compare_clip(args):
     return row
 
 
+def _saved_heading_clip(args):
+    """Saved final headings (make_predictions --save-heading) of one clip, per label: heading only (saved heading +
+    true speed) and as submitted (saved heading + saved speed)."""
+    root, clip, dirs = args
+    data = speed_clip_data(root, clip, None, [])
+    row = dict(key=clip['key'], split=clip['split'], camera_mode=clip['camera_mode'])
+    for label, d in dirs.items():
+        f = Path(d) / 'heading' / f"{clip['key']}.npz"
+        if not f.is_file():
+            row[f'{label}_head'] = row[f'{label}_sub'] = np.nan
+            continue
+        z = np.load(f)
+        row[f'{label}_head'] = _score_speed(data, z['heading'], data['tvf'])
+        row[f'{label}_sub'] = _score_speed(data, z['heading'], z['speed'])
+    return row
+
+
+def saved_heading_compare(root, clips, dirs, workers=8):
+    """Per clip: heading-only and submitted drift of several prediction dirs' saved headings (first = base)."""
+    from concurrent.futures import ProcessPoolExecutor
+    with ProcessPoolExecutor(workers) as ex:
+        rows = list(ex.map(_saved_heading_clip, [(root, c, dirs) for c in clips]))
+    labels = list(dirs)
+    L = [f"{'clip':<9}{'split':<6}{'mode':<9}" + ''.join(f'{l + " head/sub":>26}' for l in labels)]
+    for r in rows:
+        L.append(f"{r['key']:<9}{r['split']:<6}{r['camera_mode']:<9}" + ''.join(f"{r[f'{l}_head']:>14.2f}/{r[f'{l}_sub']:<11.2f}" for l in labels))
+    L.append(f"{'mean':<24}" + ''.join(f"{np.nanmean([r[f'{l}_head'] for r in rows]):>14.2f}/{np.nanmean([r[f'{l}_sub'] for r in rows]):<11.2f}" for l in labels))
+    return '\n'.join(L), rows
+
+
 def compare_runs_heading(root, clips, runs, params, workers=8):
     """Single DPVO runs side by side (label -> (pose dir, flow speed dir or None)): heading only
     (run heading + true speed) and pipeline (run heading + filtered flow speed, else constant)."""
@@ -1361,6 +1391,8 @@ def main(argv=None):
     ap.add_argument('--combo-vggt', type=Path, help='VGGT run dir: evaluate VGGT/DPVO heading combinations (wide)')
     ap.add_argument('--compare-runs', nargs='+',
                     help='LABEL=POSEDIR[+POSEDIR...][:SPEEDDIR]; several pose dirs = circular-median heading (first = base)')
+    ap.add_argument('--saved-heading', nargs='+', help='LABEL=PRED_DIR (make_predictions --save-heading): heading-only '
+                                                       '(saved heading + true speed) and submitted drift per clip; first = base')
     ap.add_argument('--zoom-analysis', action='store_true', help='flir-VIS focal: why the residual detector works or not')
     ap.add_argument('--focal-base', type=Path, nargs='+', help='focal report: base run dirs (e.g. 3 seeds at x1.0)')
     ap.add_argument('--focal-new', type=Path, nargs='+', help='focal report: run dirs at the new focal scale')
@@ -1406,6 +1438,14 @@ def main(argv=None):
         args.output.mkdir(parents=True, exist_ok=True)
         write_csv(args.output / 'combo.csv', rows)
         (args.output / 'combo.txt').write_text(text + '\n')
+        print(text)
+        return 0
+    if args.saved_heading:
+        dirs = {s.split('=', 1)[0]: REPO_ROOT / s.split('=', 1)[1] for s in args.saved_heading}
+        text, rows = saved_heading_compare(root, selected, dirs, args.workers)
+        args.output.mkdir(parents=True, exist_ok=True)
+        write_csv(args.output / 'saved_heading.csv', rows)
+        (args.output / 'saved_heading.txt').write_text(text + '\n')
         print(text)
         return 0
     if args.compare_runs:

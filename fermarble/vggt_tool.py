@@ -7,7 +7,7 @@ references.
 
 Per clip:
 - Keyframes every ~0.5 s (starter ClipPreprocessor at --keyframe-fps, the same active crop and
-  half resolution as DPVO; CLAHE on thermal clips as in run_dpvo.py --clahe), resized to 518 px wide
+  half resolution as DPVO; CLAHE on thermal clips as in run_dpvo.py --clahe unless --no-clahe), resized to 518 px wide
   and centre-cropped to a multiple of 14 rows (cropping rows keeps fx unchanged).
 - Windows of --window keyframes overlapping by --overlap; VGGT aggregator + camera head only.
 - Field of view per window: median over its frames of 2*atan(518 / (2 fx)). The implied focal
@@ -55,12 +55,13 @@ def shifted_frames(pre, frame_times, phase):
         cap.release()
 
 
-def keyframes(root, clip, fps, phase=0.0, crop=0.0, mask_path=None):
+def keyframes(root, clip, fps, phase=0.0, crop=0.0, mask_path=None, clahe_on=True):
     from preprocessing import ClipPreprocessor
     t = load_timestamps(root, clip)
     pre = ClipPreprocessor(str(asset_path(root, clip['video'])), clip['camera_mode'], fps,
                            calibration=clip['calibration'], frame_timestamps=t)
-    clahe = cv2.createCLAHE(thermal.CLAHE_CLIP_LIMIT, thermal.CLAHE_TILE_GRID) if clip['camera_mode'] in thermal.THERMAL_MODES else None
+    clahe = (cv2.createCLAHE(thermal.CLAHE_CLIP_LIMIT, thermal.CLAHE_TILE_GRID)
+             if clahe_on and clip['camera_mode'] in thermal.THERMAL_MODES else None)
     imgs, times, dec = [], [], []
     inpaint = None
     if mask_path:
@@ -114,14 +115,14 @@ def project_so3(M):
 
 
 def process_clip(model, root, clip, fps, window, overlap, run=run_window, inject_scale=None, phase=0.0, crop=0.0,
-                 mask_path=None):
+                 mask_path=None, clahe_on=True):
     """Chained poses and per-window FOV of one clip. `run(model, frames, K)` returns one window's
     camera-to-world rotations, centres and fx; with `inject_scale` it gets the released keyframe
     intrinsics with fx, fy scaled by it (else K=None). `phase` (0..1) shifts the keyframes by that
     fraction of the keyframe interval; `crop` drops that fraction of each frame at the bottom;
-    `mask_path` inpaints that mask (static own-boat structure) first."""
+    `mask_path` inpaints that mask (static own-boat structure) first; `clahe_on=False` skips CLAHE on thermal clips."""
     t0 = time.time()
-    frames, times, dec, nominal, n_frames, K = keyframes(root, clip, fps, phase, crop, mask_path)
+    frames, times, dec, nominal, n_frames, K = keyframes(root, clip, fps, phase, crop, mask_path, clahe_on)
     K = np.diag([inject_scale, inject_scale, 1.0]) @ K if inject_scale is not None else None
     n = len(frames)
     R = np.full((n, 3, 3), np.nan)
@@ -174,6 +175,7 @@ def build_parser(description):
     ap.add_argument('--crops', type=Path, help='JSON {clip: fraction}: drop that fraction of each frame at the bottom')
     ap.add_argument('--edits', type=Path, help='JSON {clip: {"crop": fraction, "mask": png}} (structure_masks.py): '
                                                'inpaint the mask, then crop; overrides --crops for its clips')
+    ap.add_argument('--no-clahe', action='store_true', help='no CLAHE on thermal (flir-IR) keyframes (default: CLAHE)')
     return ap
 
 
@@ -196,11 +198,13 @@ def run_clips(model, args, run=run_window, inject_scale=None, name='vggt'):
             ed = edits.get(c['key'], {})
             crop = float(ed.get('crop', crops.get(c['key'], 0.0)))
             res, secs = process_clip(model, root, c, args.keyframe_fps, args.window, args.overlap, run, inject_scale,
-                                     args.phase, crop, ed.get('mask'))
+                                     args.phase, crop, ed.get('mask'), not args.no_clahe)
             if ed.get('mask'):
                 res['inpaint_mask'] = np.array(ed['mask'])
             if crop:
                 res['crop_bottom'] = np.float64(crop)
+            if args.no_clahe:
+                res['no_clahe'] = np.bool_(True)
             if args.phase:
                 res['keyframe_phase'] = np.float64(args.phase)
             if inject_scale is not None:
