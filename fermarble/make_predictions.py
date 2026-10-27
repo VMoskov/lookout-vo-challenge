@@ -40,7 +40,8 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, s
                  broken_seed=None, tiebreak_path=None, fm_paths=None, fm_combine=None, vggt_label='vggt',
                  fm_speed_path=None, fm_speed_mode=None, fm_speed_sigma=POSE_SPEED_SIGMA_S,
                  referee_path=None, referee_margin=0.0, referee_label='pi3x', agree_paths=None, agree_rule=None,
-                 yaw_scale=1.0, vggt_sigma=None, max_yaw=None, max_accel=None, vggt_combine='median'):
+                 yaw_scale=1.0, vggt_sigma=None, max_yaw=None, max_accel=None, vggt_combine='median',
+                 vggt_weights=None):
     """Returns (prediction dict, info dict) for one clip.
 
     `pose_paths` lists one npz per DPVO run (e.g. per seed); several runs are combined by the
@@ -69,7 +70,8 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, s
     runs, e.g. VGGT and Pi3X): if the DPVO median turns < T deg in total and the two agree (60 s
     heading-change RMS < D deg), the circular mean of their headings is used. `yaw_scale` multiplies
     the heading change when the --vggt source's heading (after any blend) replaces the median
-    (rotation-scale calibration). `vggt_sigma` smooths the --vggt source (default `sigma_s`).
+    (rotation-scale calibration). `vggt_weights` (one per --vggt run) weight its circular mean
+    (e.g. Pi3X 0.8 / VGGT 0.2; missing and zero-weight runs are left out, equal weights = the plain mean). `vggt_sigma` smooths the --vggt source (default `sigma_s`).
     `max_yaw` (deg/s) / `max_accel` (x median speed per s) apply physical priors to the final path
     (common.apply_motion_priors).
     """
@@ -86,13 +88,15 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, s
             runs.append((data['poses'], data['times']))
         except Exception as exc:  # corrupt/mismatched npz -> skip this run, but say why
             errors.append(f'{path}: {str(exc)[:200]}')
-    dpvo_runs, vggt_runs = list(runs), []
-    for vp in ([vggt_path] if isinstance(vggt_path, Path) else vggt_path or []):
-        if vp.is_file():
+    dpvo_runs, vggt_runs, vggt_w = list(runs), [], []
+    vps = [vggt_path] if isinstance(vggt_path, Path) else vggt_path or []
+    for vp, w in zip(vps, vggt_weights or [1.0] * len(vps)):
+        if vp.is_file() and w != 0:
             zv = load_pose_npz(vp)
             if not np.allclose(zv['times'], frame_times[zv['frame_indices']], rtol=0, atol=1e-6):
                 raise ValueError(f'{vp}: VGGT pose times do not match released frame timestamps')
             vggt_runs.append((zv['poses'], zv['times']))
+            vggt_w.append(w)
     if vggt_member:
         runs += vggt_runs
     fm_runs = []
@@ -134,8 +138,12 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, s
             info['method'] += f'+median_of_{1 + len(fm_heads)}'
         vs = vggt_sigma if vggt_sigma is not None else sigma_s
         if vggt_combine == 'mean' and len(vggt_runs) > 1:
-            hs = [x for x in (_run_heading(*r, frame_times, vs)[0] for r in vggt_runs) if x is not None]
-            hv = hs[0] + np.angle(np.mean([np.exp(1j * (x - hs[0])) for x in hs], axis=0)) if hs else None
+            hw = [(x, w) for x, w in zip((_run_heading(*r, frame_times, vs)[0] for r in vggt_runs), vggt_w) if x is not None]
+            hs = [x for x, _ in hw]
+            if hs and len({w for _, w in hw}) > 1:
+                hv = hs[0] + np.angle(np.average([np.exp(1j * (x - hs[0])) for x in hs], axis=0, weights=[w for _, w in hw]))
+            else:
+                hv = hs[0] + np.angle(np.mean([np.exp(1j * (x - hs[0])) for x in hs], axis=0)) if hs else None
         else:
             hv = multi_run_heading(vggt_runs, frame_times, vs)[0] if vggt_runs else None
         if hv is not None:
@@ -240,6 +248,9 @@ def main(argv=None):
                     help='vggt_tool.py / pi3_tool.py output dir(s): DPVO/VGGT heading switch; several = their median')
     ap.add_argument('--vggt-combine', choices=['median', 'mean'], default='median',
                     help='several --vggt runs: per-frame circular median (default) or circular mean')
+    ap.add_argument('--vggt-weights', nargs='+',
+                    help='W,W,... (one per --vggt run) or MODE=W,W,... per camera mode, for --vggt-combine mean; '
+                         'a weight of 0 leaves that run out')
     ap.add_argument('--vggt-label', default='vggt', help='name of the --vggt source in the method label')
     ap.add_argument('--fm-speed', type=Path, help='foundation-model run dir: speed from its camera centres')
     ap.add_argument('--fm-speed-mode', choices=['replace', 'fallback'], default='replace')
@@ -288,6 +299,10 @@ def main(argv=None):
     if agree_rule and not (args.agree_a and args.agree_b):
         ap.error('--agree-rule needs --agree-a and --agree-b')
     flat_rule = tuple(float(x) for x in args.flat_rule.split(',')) if args.flat_rule else None
+    vggt_weights = {(s.split('=')[0] if '=' in s else '*'): [float(x) for x in s.split('=')[-1].split(',')]
+                    for s in args.vggt_weights or []}
+    if vggt_weights and (args.vggt_combine != 'mean' or any(len(w) != len(args.vggt or []) for w in vggt_weights.values())):
+        ap.error('--vggt-weights needs --vggt-combine mean and one weight per --vggt run')
     records = {}
     for clip in selected:
         key = clip['key']
@@ -312,7 +327,8 @@ def main(argv=None):
                                   if agree_rule and clip['camera_mode'] in args.agree_modes.split(',') else None,
                                   agree_rule, yaw_scales.get(clip['camera_mode'], yaw_scales.get('*', 1.0)),
                                   args.vggt_sigma, per_mode(args.max_yaw_rate, clip['camera_mode']),
-                                  per_mode(args.max_accel, clip['camera_mode']), args.vggt_combine)
+                                  per_mode(args.max_accel, clip['camera_mode']), args.vggt_combine,
+                                  vggt_weights.get(clip['camera_mode'], vggt_weights.get('*')))
         write_json(args.output / 'predictions' / f'{key}.json', pred)
         # JSON cannot hold NaN: a diagnostic that is undefined for a clip is recorded as null
         info = {k: (None if isinstance(v, float) and not np.isfinite(v) else v) for k, v in info.items()}
@@ -329,6 +345,7 @@ def main(argv=None):
                     agree_rule=list(agree_rule) if agree_rule else None,
                     yaw_scale=yaw_scales if args.vggt else None,
                     vggt_combine=args.vggt_combine if args.vggt and len(args.vggt) > 1 else None,
+                    vggt_weights=vggt_weights or None,
                     max_yaw_rate=args.max_yaw_rate, max_accel=args.max_accel,
                     vggt_sigma=args.vggt_sigma if args.vggt else None,
                     agree=[str(args.agree_a), str(args.agree_b)] if agree_rule else None,
