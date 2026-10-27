@@ -69,7 +69,8 @@ def horizon_diff(d):
 def longest_gap(d, params):
     """Longest stretch (s) without a reliable pair, including the clip ends (gap-filled stretch)."""
     t, v, _, _ = flow_reliable_speed(d, params['agree_tol'], params['side_max'], params['drop_backward'],
-                                     params.get('band_min'), params['window_s'])
+                                     params.get('band_min'), params['window_s'], params.get('near_w'),
+                                     params.get('near_reliable', False))
     tr = t[np.isfinite(v)]
     if len(tr) == 0:
         return float(t[-1] - t[0])

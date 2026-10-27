@@ -112,7 +112,7 @@ def main():
         new = sn if inn['speed_fallback'] == 'none' else np.ones(len(t))
         rel_o = flow_reliable_speed(do, v3a['agree_tol'], v3a['side_max'], v3a['drop_backward'])[2]
         rel_n = flow_reliable_speed(dn, pc['agree_tol'], pc['side_max'], pc['drop_backward'], pc.get('band_min'),
-                                    pc['window_s'])[2]
+                                    pc['window_s'], pc.get('near_w'), pc.get('near_reliable', False))[2]
         raw_o = smooth_raw(do, t)
         nw, sd, st = int(dn['water_samples']), int(dn.get('seg_dropped', 0)), int(dn.get('still_removed', 0))
         jumps, low, cp, cr, fl = flags(t, new, old, raw_o, longest_gap(dn, pc) if inn['speed_fallback'] == 'none' else 0.0)
@@ -121,7 +121,7 @@ def main():
             ax.plot(tt, raw_o, color='0.6', lw=0.8, label='old raw flow (all water samples, 4 s median)')
         ax.plot(tt, old if old is not None else np.ones(len(t)), 'b', lw=1.5,
                 label='old pipeline speed' + ('' if old is not None else f" (constant: {io['speed_fallback']})"))
-        ax.plot(tt, new, 'r', lw=1.5, label='new (seg c) speed' + ('' if inn['speed_fallback'] == 'none' else ' (constant)'))
+        ax.plot(tt, new, 'r', lw=1.5, label='new speed' + ('' if inn['speed_fallback'] == 'none' else ' (constant)'))
         ax.set_ylim(0, max(3.0, float(np.nanpercentile(new, 99)) * 1.1))
         ax.set_title(f"{k} {c['camera_mode']}: reliable pairs {rel_o:.2f} -> {rel_n:.2f}; band non-water {sd / max(1, nw + sd):.0%}; "
                      f"flags: {', '.join(fl) or 'none'}", fontsize=9)

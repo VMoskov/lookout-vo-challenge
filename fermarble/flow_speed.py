@@ -248,6 +248,8 @@ SEG_WATER = 10                # LaRS class id of water in seg_run.py masks
 SEG_SKY = 11
 SEG_MIN_COLS = 0.3            # segmentation horizon: fit a line only if >= this fraction of columns has water
 SEG_SIGMA_S = 1.0             # ... then median over 9 segmented frames and Gaussian smoothing in time
+HS_CAND_PX = 5.0              # horizon sanity (hsU variants): windows where DPVO's horizon is > this below the water edge ...
+HS_CAND_CROSS = 0.1           # ... or crosses non-water below the edge in > this fraction of columns are refitted
 
 
 def seg_water_points(seg, dec, p):
@@ -294,12 +296,13 @@ def seg_horizon_lines(seg, H, sky_only=False):
     return out
 
 
-def seg_horizon_ups(seg, times, K, W, H, sky_only=False):
+def seg_horizon_ups(seg, times, K, W, H, sky_only=False, shift_px=0.0):
     """Camera-frame up vector per frame whose horizon (rays with u.r = 0) is the segmentation line,
     median-filtered over 9 segmented frames and smoothed in time (SEG_SIGMA_S). None if no frame
     has a line. The line is the visible water edge: the true horizon at open sea, the shoreline
-    (below the horizon) in harbours."""
+    (below the horizon) in harbours. `shift_px` moves the line up by that many pixels."""
     lines = seg_horizon_lines(seg, H, sky_only)
+    lines[:, 1] -= shift_px
     ok = np.isfinite(lines).all(1)
     if ok.sum() < 3:
         return None, lines
@@ -316,6 +319,32 @@ def seg_horizon_ups(seg, times, K, W, H, sky_only=False):
     u /= np.linalg.norm(u, axis=1, keepdims=True)
     u[u[:, 1] > 0] *= -1                                    # up = camera -y side
     return u, lines
+
+
+def horizon_sanity_stats(seg, dpvo_up, K, times, H, W):
+    """Per HORIZON_WINDOW_S window (from the first frame): median over the segmented frames of how far (px) DPVO's
+    (mount-corrected) horizon lies below the PanSR water edge (median over columns), and of the fraction of columns
+    where it crosses non-water, non-sky pixels below that edge (own boat, obstacles). Returns (window starts,
+    below, cross, window index per frame)."""
+    q = int(seg['quarter'])
+    m = seg['masks']
+    xs = np.arange(4, W - 4, 8, dtype=float)
+    xi = xs.astype(int)
+    t0s = np.arange(times[0], times[-1], HORIZON_WINDOW_S)
+    win = np.clip(((times - times[0]) // HORIZON_WINDOW_S).astype(int), 0, len(t0s) - 1)
+    below, cross = [[] for _ in t0s], [[] for _ in t0s]
+    for j, f in enumerate(seg['seg_frames']):
+        y = horizon_rows(dpvo_up[f], K, xs)
+        top = seg['water_top'][j][xi].astype(float)
+        ok = np.isfinite(y) & (top > 0) & (top < H - 1)
+        if ok.sum() < SEG_MIN_COLS * len(xs):
+            continue
+        yy = np.clip(y[ok], 0, H - 1).astype(int)
+        cls = m[j, np.clip(yy // q, 0, m.shape[1] - 1), np.clip(xi[ok] // q, 0, m.shape[2] - 1)]
+        below[win[f]].append(float(np.median(y[ok] - top[ok])))
+        cross[win[f]].append(float(np.mean((y[ok] > top[ok] + 2) & (cls != SEG_WATER) & (cls != SEG_SKY))))
+    med = lambda v: np.array([np.median(x) if x else np.nan for x in v])
+    return t0s, med(below), med(cross), win
 
 
 def process_clip(root, clip, pose_paths, out_path, target_fps=8.0, focal_scale=1.0, rot_path=None, drop_still=False,
@@ -368,20 +397,38 @@ def process_clip(root, clip, pose_paths, out_path, target_fps=8.0, focal_scale=1
         raise FileNotFoundError('segmentation file needed for this variant')
     segwater = seg_water_points(seg, dec, p) if seg is not None else None
     useg, lines = seg_horizon_ups(seg, times, K, W, H) if seg is not None else (None, None)
+    hs = {}
+    if seg is not None and any(v.get('hs') is not None for _, v in variants):
+        dpvo_up = np.einsum('kij,kj->ki', np.stack([correction(a, b) for a, b in zip(hp, hr)]), ups)
+        dpvo_up /= np.linalg.norm(dpvo_up, axis=1, keepdims=True)
+        t0s, below, cross, win = horizon_sanity_stats(seg, dpvo_up, K, times, H, W)
+        cand_w = (np.nan_to_num(below, nan=-np.inf) > HS_CAND_PX) | (np.nan_to_num(cross) > HS_CAND_CROSS)
+        hs = dict(t0s=t0s, below=below, cross=cross, pair_window=win[:-1], cand=cand_w[win[:-1]])
+        for u_px in {v['hs'] for _, v in variants if v.get('hs') is not None}:
+            hs[u_px] = seg_horizon_ups(seg, times, K, W, H, shift_px=u_px)[0]
     usky, lines_sky = (seg_horizon_ups(seg, times, K, W, H, sky_only=True)
                        if seg is not None and any(v.get('skyhorizon') for _, v in variants) else (None, None))
     still_all = still_runs(flows, gy.ravel()) if any(v['still'] for _, v in variants) else None
-    summary = None
+    summary, done = None, {}
     for vpath, v in variants:
         uh, lh = (usky, lines_sky) if v.get('skyhorizon') else (useg, lines)
-        summary = _fit_variant(vpath, v, clip, flows, p, rays, static, still_all, segwater, uh, lh, R, ups, hp, hr,
-                               htable, pose_ok, times, dec, K, focal_scale, n, pose_used, t0, t_dec, t_flow)
+        base = done.get((v['mask'], v['still'])) if v.get('hs') is not None else None
+        if v.get('hs') is not None and base is None:
+            raise ValueError('an hsU variant needs the same variant without hs listed before it')
+        summary, out = _fit_variant(vpath, v, clip, flows, p, rays, static, still_all, segwater, uh, lh, R, ups, hp, hr,
+                                    htable, pose_ok, times, dec, K, focal_scale, n, pose_used, t0, t_dec, t_flow,
+                                    hs if v.get('hs') is not None else None, base)
+        if v.get('hs') is None and not (v['horizon'] or v.get('skyhorizon') or v.get('fixed')):
+            done[(v['mask'], v['still'])] = out
     return summary
 
 
 def _fit_variant(out_path, v, clip, flows, p, rays, static, still_all, segwater, useg, lines, R, ups, hp, hr, htable,
-                 pose_ok, times, dec, K, focal_scale, n, pose_used, t0, t_dec, t_flow):
-    """Steps 3-5 for one variant of process_clip (see there); writes out_path, returns the summary."""
+                 pose_ok, times, dec, K, focal_scale, n, pose_used, t0, t_dec, t_flow, hs=None, base=None):
+    """Steps 3-5 for one variant of process_clip (see there); writes out_path, returns (summary, per-pair results).
+    hsU variants (`hs` = horizon_sanity_stats tables + shifted segmentation ups, `base` = the same variant without
+    hs): pairs in candidate windows use the segmentation horizon shifted up by U px, all others are copied from
+    `base`; common.hs_merge then applies the fitted rule."""
     drop_still = v['still']
     still = still_all if drop_still else np.zeros((n - 1, len(p)), bool)
     n_water = n_removed = n_seg_drop = 0
@@ -395,10 +442,15 @@ def _fit_variant(out_path, v, clip, flows, p, rays, static, still_all, segwater,
     keys = ('a_all', 'b_all', 'rmse_all', 'n_all', 'a_near', 'b_near', 'rmse_near', 'n_near',
             'a_far', 'b_far', 'rmse_far', 'n_far')
     out = {k: np.full(n - 1, np.nan) for k in keys}
+    u_hs = hs[v['hs']] if hs is not None else None
     for k in range(n - 1):
+        if hs is not None and not (hs['cand'][k] and u_hs is not None and np.isfinite(u_hs[k]).all()):
+            for key in keys:
+                out[key][k] = base[key][k]
+            continue
         if not (pose_ok[k] and pose_ok[k + 1]):
             continue
-        u = useg[k] if seg_h else correction(hp[k], hr[k]) @ ups[k]
+        u = u_hs[k].copy() if hs is not None else useg[k] if seg_h else correction(hp[k], hr[k]) @ ups[k]
         u /= np.linalg.norm(u)
         water, s = water_region(rays, u, static)
         split = np.median(s[water]) if fixed and water.any() else None   # geometric bands, before masking
@@ -436,7 +488,10 @@ def _fit_variant(out_path, v, clip, flows, p, rays, static, still_all, segwater,
              still_points=np.int64(still.any(0).sum()), seg_mask=bool(v['mask']), seg_horizon=bool(seg_h),
              seg_dropped=np.int64(n_seg_drop), **({'seg_lines': lines} if lines is not None else {}),
              **({'seg_up': useg} if seg_h else {}), dpvo_up=dpvo_up,
-             **({'n_band_near': n_band['near'], 'n_band_far': n_band['far']} if fixed else {}))
+             **({'n_band_near': n_band['near'], 'n_band_far': n_band['far']} if fixed else {}),
+             **({'hs_shift_px': np.float64(v['hs']), 'hs_window_t0': hs['t0s'], 'hs_window_below': hs['below'],
+                 'hs_window_cross': hs['cross'], 'hs_pair_window': hs['pair_window'], 'hs_cand': hs['cand']}
+                if hs is not None else {}))
     return dict(key=clip['key'], camera_mode=clip['camera_mode'], n_pairs=n - 1, poses=pose_used,
                 focal_scale=focal_scale,
                 valid_frac=float(np.isfinite(speeds['speed_all']).mean()),
@@ -446,7 +501,10 @@ def _fit_variant(out_path, v, clip, flows, p, rays, static, still_all, segwater,
                 horizon_pitch_deg=[round(float(np.min(hp)), 2), round(float(np.max(hp)), 2)],
                 horizon_roll_deg=[round(float(np.min(hr)), 2), round(float(np.max(hr)), 2)],
                 static_frac=float(static.mean()),
-                decode_s=round(t_dec, 1), flow_s=round(t_flow, 1), total_s=round(time.time() - t0, 1))
+                decode_s=round(t_dec, 1), flow_s=round(t_flow, 1), total_s=round(time.time() - t0, 1),
+                **({'hs_cand_frac': float(hs['cand'].mean()),
+                    'hs_max_below_px': float(np.nanmax(hs['below'])) if np.isfinite(hs['below']).any() else None}
+                   if hs is not None else {})), out
 
 
 def render_frames(root, clip, d, pose_dirs, times_s, labels, out_png, width=640):
@@ -515,8 +573,9 @@ def main(argv=None):
     ap.add_argument('--drop-still', action='store_true',
                     help='drop water samples whose flow stays far below their row for >= STILL_RUN pairs (droplets)')
     ap.add_argument('--seg', type=Path, help='seg_run.py output dir (PanSR masks) for --variant')
-    ap.add_argument('--variant', nargs='+', help="NAME=FLAGS with FLAGS from mask,horizon,skyhorizon,fixed,still joined by '+': "
-                                               "one flow computation, outputs <output>-NAME (needs --seg)")
+    ap.add_argument('--variant', nargs='+', help="NAME=FLAGS with FLAGS from mask,horizon,skyhorizon,fixed,still,hsU (U = px) "
+                                               "joined by '+': one flow computation, outputs <output>-NAME (needs --seg); "
+                                               "an hsU variant follows the same variant without hsU")
     ap.add_argument('--render', action='store_true',
                     help='only render a geometry check (3 frames with horizon/water) per processed clip')
     args = ap.parse_args(argv)
@@ -542,11 +601,12 @@ def main(argv=None):
         for spec in args.variant:
             name, flags = spec.split('=', 1)
             fl = set(flags.split('+')) - {''}
-            if fl - {'mask', 'horizon', 'skyhorizon', 'fixed', 'still', 'none'}:
+            hsu = [f for f in fl if f[:2] == 'hs' and f[2:].replace('.', '', 1).isdigit()]
+            if fl - set(hsu) - {'mask', 'horizon', 'skyhorizon', 'fixed', 'still', 'none'} or len(hsu) > 1:
                 ap.error(f'unknown variant flags in {spec}')
             variants.append((args.output.parent / f'{args.output.name}-{name}', dict(
                 mask='mask' in fl, horizon='horizon' in fl, still='still' in fl, skyhorizon='skyhorizon' in fl,
-                fixed='fixed' in fl)))
+                fixed='fixed' in fl, hs=float(hsu[0][2:]) if hsu else None)))
     jobs = []
     for c in clips:
         out = args.output / 'speed' / f"{c['key']}.npz"

@@ -575,7 +575,8 @@ def speed_variation(speed):
     return float(speed.std() / speed.mean()), float(speed.max() / med) if med > 0 else float('inf')
 
 
-def flow_reliable_speed(d, agree_tol, side_max=NO_LIMIT, drop_backward=False, band_min=None, window_s=8.0):
+def flow_reliable_speed(d, agree_tol, side_max=NO_LIMIT, drop_backward=False, band_min=None, window_s=8.0,
+                        near_w=None, near_reliable=False):
     """Stage 1 of filter_flow_speed: normalised near/far bands, agreement test, geometric mean.
     A pair is also unreliable when its fitted motion is more than side_max sideways
     (|sideways| / |displacement|) or, with drop_backward, points backwards: a boat under way
@@ -586,6 +587,9 @@ def flow_reliable_speed(d, agree_tol, side_max=NO_LIMIT, drop_backward=False, ba
     bands use the agreement test; pairs with one band (e.g. shore covers the far band) are kept
     only when that band's normalised speed is within agree_tol / 2 of the window_s rolling median
     of the two-band speeds (stricter, no extra parameter).
+    With `near_w` (unbanded path): pairs whose bands disagree beyond agree_tol get the weighted geometric
+    mean near^near_w * far^(1 - near_w) instead of NaN (near-band preference); the reliable fraction (clip
+    fallback) still counts only agreeing pairs unless `near_reliable`.
     Returns (t_mid, speed or NaN where unreliable, reliable fraction, n usable pairs)."""
     if band_min is not None and 'n_band_near' in d:
         return _flow_reliable_banded(d, agree_tol, side_max, drop_backward, band_min, window_s)
@@ -605,7 +609,19 @@ def flow_reliable_speed(d, agree_tol, side_max=NO_LIMIT, drop_backward=False, ba
                 agree &= np.abs(b) <= side_max * np.hypot(a, b)
             if drop_backward:
                 agree &= a > 0
-    return t, np.where(agree, np.sqrt(nn * ff), np.nan), float(agree.mean()), int(agree.sum())
+    v = np.where(agree, np.sqrt(nn * ff), np.nan)
+    if near_w is None:
+        return t, v, float(agree.mean()), int(agree.sum())
+    with np.errstate(divide='ignore', invalid='ignore'):
+        motion = ok.copy()
+        a, b = np.asarray(d['a_all'], float), np.asarray(d['b_all'], float)
+        if side_max < 1.0:
+            motion &= np.abs(b) <= side_max * np.hypot(a, b)
+        if drop_backward:
+            motion &= a > 0
+        v = np.where(motion & ~agree, np.exp(near_w * np.log(nn) + (1 - near_w) * np.log(ff)), v)
+    ok_v = np.isfinite(v)
+    return t, v, float(ok_v.mean() if near_reliable else agree.mean()), int(ok_v.sum())
 
 
 def _flow_reliable_banded(d, agree_tol, side_max, drop_backward, band_min, window_s):
@@ -634,6 +650,25 @@ def _flow_reliable_banded(d, agree_tol, side_max, drop_backward, band_min, windo
     v = np.where(keep, single, v)
     ok = np.isfinite(v)
     return t, v, float(ok.mean()), int(ok.sum())
+
+
+HS_KEYS = ('a_all', 'b_all', 'rmse_all', 'n_all', 'a_near', 'b_near', 'rmse_near', 'n_near', 'a_far', 'b_far',
+           'rmse_far', 'n_far', 'speed_all', 'speed_near', 'speed_far')
+
+
+def hs_merge(d_base, d_hs, below_px, cross_frac=NO_LIMIT):
+    """Horizon sanity rule on flow_speed.py results: in each HORIZON_WINDOW_S window where DPVO's horizon lies
+    more than `below_px` below the segmented water edge or crosses non-water pixels below that edge (own boat,
+    obstacles) in more than `cross_frac` of the columns (window medians stored by the hsU variant), use the
+    pairs of `d_hs` (segmentation horizon shifted up by U px) instead of `d_base` (same flow). Returns
+    (merged dict, fraction of pairs replaced)."""
+    fire = (np.asarray(d_hs['hs_window_below'], float) > below_px) | (np.asarray(d_hs['hs_window_cross'], float) > cross_frac)
+    w = np.asarray(d_hs['hs_pair_window'])
+    sel = (w >= 0) & fire[np.clip(w, 0, max(len(fire) - 1, 0))] if len(fire) else np.zeros(len(w), bool)
+    out = dict(d_base)
+    for k in HS_KEYS:
+        out[k] = np.where(sel, np.asarray(d_hs[k], float), np.asarray(d_base[k], float))
+    return out, float(sel.mean())
 
 
 def flow_speed_from_reliable(t, v, frame_times, window_s, clamp_lo, clamp_hi, smoothed=None):
@@ -666,7 +701,8 @@ def filter_flow_speed(d, frame_times, params=None):
         return np.ones(len(frame_times)), dict(speed_fallback='horizon', horizon_jump=jump, reliable_frac=np.nan,
                                                fallback_frac=1.0)
     t, v, rel_frac, n_rel = flow_reliable_speed(d, p['agree_tol'], p['side_max'], p['drop_backward'],
-                                                p.get('band_min'), p['window_s'])
+                                                p.get('band_min'), p['window_s'], p.get('near_w'),
+                                                p.get('near_reliable', False))
     if rel_frac < p['min_reliable_frac'] or n_rel < 10:
         return np.ones(len(frame_times)), dict(speed_fallback='clip', reliable_frac=rel_frac, fallback_frac=1.0)
     speed, filled = flow_speed_from_reliable(t, v, frame_times, p['window_s'], p['clamp_lo'], p['clamp_hi'])

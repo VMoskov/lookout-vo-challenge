@@ -129,12 +129,14 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, s
                 speed = fs
                 speed_info['speed_source'] = 'pose_speed'
         positions, info = multi_run_heading_constant_speed(runs, frame_times, sigma_s, speed=speed)
+        final_h, final_speed = None, speed   # DPVO-only path (heading not kept)
         info.update(speed_info)
         fm_heads = [x for x in (_run_heading(*r, frame_times, sigma_s)[0] for r in fm_runs) if x is not None]
         if fm_combine == 'median3' and fm_heads and info['method'] != 'straight_line_fallback':
             # per-frame circular median of the DPVO median and each foundation model
             h3 = circular_median([multi_run_heading(dpvo_runs, frame_times, sigma_s)[0]] + fm_heads)
             positions = integrate_planar(frame_times, h3, speed if speed is not None else np.ones(len(frame_times)))
+            final_h, final_speed = h3, speed
             info['method'] += f'+median_of_{1 + len(fm_heads)}'
         vs = vggt_sigma if vggt_sigma is not None else sigma_s
         if vggt_combine == 'mean' and len(vggt_runs) > 1:
@@ -158,6 +160,7 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, s
                     info.update(referee_dpvo_deg=d_dpvo, referee_fm_deg=d_ref, referee_uses_fm=bool(use_ref))
                     if use_ref:
                         positions = integrate_planar(frame_times, hr, speed if speed is not None else np.ones(len(frame_times)))
+                        final_h, final_speed = hr, speed
                         info['method'] += f'+{referee_label}_referee'
                         switch_deg = broken_seed = flat_rule = None   # the referee model's heading is final
             if switch_deg is not None and h is not None and info['method'] != 'straight_line_fallback':
@@ -196,6 +199,7 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, s
                 if yaw_scale != 1.0:
                     hv = yaw_scale * hv          # rotation-scale calibration of the final heading
                 positions = integrate_planar(frame_times, hv, speed if speed is not None else np.ones(len(frame_times)))
+                final_h, final_speed = hv, speed
                 info['method'] += f'+{vggt_label}_heading'
         if agree_rule is not None and agree_paths and info['method'] != 'straight_line_fallback':
             ha, hb = (heading_from(p, frame_times, sigma_s) for p in agree_paths)
@@ -207,6 +211,7 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, s
                 if fires:
                     hm = ha + np.angle(0.5 * (1 + np.exp(1j * (hb - ha))))   # circular mean, unwrapped along ha
                     positions = integrate_planar(frame_times, hm, speed if speed is not None else np.ones(len(frame_times)))
+                    final_h, final_speed = hm, speed
                     info['method'] += '+fm_agree_heading'
     if errors:
         info['pose_errors'] = errors
@@ -217,6 +222,8 @@ def predict_clip(root, clip, pose_paths, sigma_s=SMOOTH_SIGMA_S, invert=False, s
         info.update(max_yaw_deg_s=max_yaw, max_accel=max_accel)
     pred = prediction_dict(clip['key'], frame_times, positions)
     validate_prediction(pred, clip['key'], frame_times)
+    if not invert and max_yaw is None and max_accel is None and final_h is not None:
+        info['_final'] = (final_h, final_speed)   # popped by main (--save-heading)
     return pred, info
 
 
@@ -241,6 +248,8 @@ def main(argv=None):
     ap.add_argument('--sigma', type=float, default=SMOOTH_SIGMA_S, help='heading smoothing sigma, s')
     ap.add_argument('--invert-poses', action='store_true', help='convention check: treat poses as world-to-camera')
     ap.add_argument('--overwrite', action='store_true', help='allow a non-empty --output')
+    ap.add_argument('--save-heading', action='store_true',
+                    help='also write <output>/heading/<clip>.npz: the final heading and speed of the path (oracle speed fits)')
     ap.add_argument('--speed', type=Path, help='flow_speed.py output dir: use flow speed instead of constant')
     ap.add_argument('--speed-params', type=Path, help='JSON of filter_flow_speed thresholds (fitted on train)')
     ap.add_argument('--speed-modes', default='wide', help='camera modes that use flow speed (others constant)')
@@ -330,6 +339,11 @@ def main(argv=None):
                                   per_mode(args.max_accel, clip['camera_mode']), args.vggt_combine,
                                   vggt_weights.get(clip['camera_mode'], vggt_weights.get('*')))
         write_json(args.output / 'predictions' / f'{key}.json', pred)
+        final = info.pop('_final', None)
+        if args.save_heading and final is not None:
+            (args.output / 'heading').mkdir(parents=True, exist_ok=True)
+            np.savez(args.output / 'heading' / f'{key}.npz', heading=final[0],
+                     speed=final[1] if final[1] is not None else np.ones(len(pred['times'])), speed_from_flow=final[1] is not None)
         # JSON cannot hold NaN: a diagnostic that is undefined for a clip is recorded as null
         info = {k: (None if isinstance(v, float) and not np.isfinite(v) else v) for k, v in info.items()}
         records[key] = dict(split=clip['split'], camera_mode=clip['camera_mode'],

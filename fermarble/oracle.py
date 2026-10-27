@@ -1251,6 +1251,95 @@ def gate_tune(root, clips, old_dir, new_prefix, pi3x_dir, workers=8, grid=None):
     return rows[0], rows, res, base
 
 
+SF_P = [10, 20, 40, 80, 160, NO_LIMIT]          # horizon sanity: DPVO horizon > P px below the water edge ...
+SF_C = [0.15, 0.3, NO_LIMIT]                   # ... or crossing non-water below it in > C of the columns
+SF_U = [0, 5, 10, 15, 20]                      # segmentation horizon shifted up by U px
+SF_W = [0.6, 0.7, 0.8, 0.9, 1.0]               # near-band weight for disagreeing pairs
+SF_REL = [False, True]                         # weighted pairs count as reliable (clip fallback) or not
+
+
+def speedfix_candidates():
+    """(family, label, flow variant, hs variant or None, P, C, filter overrides) for the speed-fix fit."""
+    out = []
+    for u in SF_U:
+        for pp in SF_P:
+            for cc in SF_C:
+                if pp == NO_LIMIT and cc == NO_LIMIT:
+                    continue
+                out.append(('hs', f'U{u} P{pp:g} C{cc:g}', 'none', f'hs{u}', pp, cc, {}))
+                for w in SF_W:
+                    for rel in SF_REL:
+                        out.append(('hs+near', f'U{u} P{pp:g} C{cc:g} w{w:g} rel{int(rel)}', 'mask', f'mhs{u}', pp, cc,
+                                    dict(near_w=w, near_reliable=rel)))
+    for fl in ('none', 'mask'):
+        out.append(('near', f'{fl} no-near', fl, None, None, None, {}))
+        for w in SF_W:
+            for rel in SF_REL:
+                out.append(('near', f'{fl} w{w:g} rel{int(rel)}', fl, None, None, None, dict(near_w=w, near_reliable=rel)))
+    return out
+
+
+def _speedfix_clip(args):
+    """One clip: drift of the base path (saved final heading + base speed) and of every speed-fix candidate (same
+    heading, candidate flow speed; constant where the filter falls back, as in make_predictions)."""
+    from common import filter_flow_speed, hs_merge
+    root, clip, base_dir, flow_prefix, params = args
+    k = clip['key']
+    frame_t = load_timestamps(root, clip)
+    ref_t, ref_xyz = load_reference(root, clip)
+    z = np.load(base_dir / 'heading' / f'{k}.npz')
+    h, base_speed = z['heading'], z['speed']
+    base = score(frame_t, integrate_planar(frame_t, h, base_speed), ref_t, ref_xyz)
+    flows = {}
+    def flow(v):
+        if v not in flows:
+            f = Path(f'{flow_prefix}-{v}') / 'speed' / f'{k}.npz'
+            flows[v] = dict(np.load(f)) if f.is_file() else None
+        return flows[v]
+    res = []
+    for fam, label, fv, hv, pp, cc, over in speedfix_candidates():
+        d = flow(fv)
+        frac = 0.0
+        if d is not None and hv is not None and flow(hv) is not None:
+            d, frac = hs_merge(d, flow(hv), pp, cc)
+        if d is None:
+            res.append((base, 0.0, False))
+            continue
+        sp, info = filter_flow_speed(d, frame_t, dict(params, **over))
+        if info['speed_fallback'] != 'none':
+            sp = np.ones(len(frame_t))
+        changed = not np.allclose(sp, base_speed)
+        res.append((score(frame_t, integrate_planar(frame_t, h, sp), ref_t, ref_xyz) if changed else base, frac, changed))
+    return k, clip['split'], base, res
+
+
+def speedfix_tune(root, clips, base_dir, flow_prefix, params, workers=8):
+    """Fit the speed fixes (horizon sanity rule, near-band preference, both) on the TRAIN clips among `clips`: every
+    candidate's mean drift over all train / val clips (unchanged clips keep the base drift). Returns (rows, per-clip)."""
+    from concurrent.futures import ProcessPoolExecutor
+    jobs = [(root, c, base_dir, flow_prefix, params) for c in clips
+            if c['camera_mode'] in ('wide', 'flir-VIS') and (base_dir / 'heading' / f"{c['key']}.npz").is_file()]
+    with ProcessPoolExecutor(workers) as ex:
+        res = list(ex.map(_speedfix_clip, jobs))
+    other = {s: [r['drift_pct'] for r in json.loads((base_dir / 'results.json').read_text())
+                 if r['key'] not in {k for k, _, _, _ in res} and r['split'] == s] for s in ('train', 'val')}
+    rows = []
+    for i, (fam, label, fv, hv, pp, cc, over) in enumerate(speedfix_candidates()):
+        row = dict(family=fam, label=label, flow=fv, hs=hv, P=pp, C=cc, near_w=over.get('near_w'),
+                   near_reliable=over.get('near_reliable'))
+        for s in ('train', 'val'):
+            new = [r[i][0] for _, sp, _, r in res if sp == s]
+            old = [b for _, sp, b, _ in res if sp == s]
+            row[s] = float(np.mean(new + other[s]))
+            row[f'{s}_base'] = float(np.mean(old + other[s]))
+            d = np.array(new) - np.array(old)
+            row[f'{s}_better'], row[f'{s}_worse'] = int((d < -0.05).sum()), int((d > 0.05).sum())
+            row[f'{s}_worst'] = float(d.max()) if len(d) else 0.0
+            row[f'{s}_changed'] = int(sum(r[i][2] for _, sp, _, r in res if sp == s))
+        rows.append(row)
+    return rows, res
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--dataset', type=Path, default=DEFAULT_DATASET)
@@ -1280,6 +1369,9 @@ def main(argv=None):
                     help='LABEL=PREDDIR (scored by evaluate.py), first = x1.0 base: per-clip best focal (oracle)')
     ap.add_argument('--gate-tune', nargs=3, metavar=('OLD_FLOW_DIR', 'NEW_PREFIX', 'PI3X_DIR'),
                     help='fit gated_flow.py parameters on the TRAIN clips (wide + flir-VIS) of the selection')
+    ap.add_argument('--speedfix-tune', nargs=2, metavar=('BASE_DEV_DIR', 'FLOW_PREFIX'),
+                    help='fit the speed fixes on TRAIN: base predictions made with --save-heading, flow_speed.py '
+                         'variant dirs FLOW_PREFIX-<variant> (speedfix_flow.sh); with --speed-params')
     ap.add_argument('--gate-grid', type=Path, help='JSON overriding GATE_GRID entries for --gate-tune (constraints)')
     ap.add_argument('--worst', type=int, default=0,
                     help='also list the N worst clips, classify speed/heading/DPVO failure (needs --heading-diff)')
@@ -1352,6 +1444,23 @@ def main(argv=None):
               f"train {best['train']:.3f} val {best['val']:.3f}, {best['train_new']} train clips switch")
         for r in rows[:8]:
             print({k: (round(v, 3) if isinstance(v, float) else v) for k, v in r.items()})
+        return 0
+    if args.speedfix_tune:
+        params = json.loads(args.speed_params.read_text())
+        rows, res = speedfix_tune(root, selected, Path(args.speedfix_tune[0]), args.speedfix_tune[1], params, args.workers)
+        args.output.mkdir(parents=True, exist_ok=True)
+        write_csv(args.output / 'speedfix_tune.csv', rows)
+        best = {}
+        for fam in ('hs', 'near', 'hs+near'):
+            fr = sorted((r for r in rows if r['family'] == fam), key=lambda r: (round(r['train'], 6), r['train_changed']))
+            best[fam] = fr[0]
+            print(f"best {fam} on train: {fr[0]}")
+        write_json(args.output / 'speedfix_best.json', best)
+        cands = speedfix_candidates()
+        idx = {r['label']: i for i, r in enumerate(rows)}
+        write_json(args.output / 'speedfix_clips.json',
+                   [dict(key=k, split=s, base=b, **{fam: dict(drift=r[idx[best[fam]['label']]][0], replaced=r[idx[best[fam]['label']]][1])
+                                                     for fam in best}) for k, s, b, r in res])
         return 0
     if args.focal_lower_bound:
         runs = {kv.split('=', 1)[0]: Path(kv.split('=', 1)[1]) for kv in args.focal_lower_bound}
