@@ -25,6 +25,15 @@ from common import (DEFAULT_DATASET, SMOOTH_SIGMA_S, heading_constant_speed, loa
                     prediction_dict, select_clips, validate_prediction, write_json)
 
 
+def pi3x_focal_scale(path):
+    """Focal length a Pi3X / VGGT run estimates vs the nominal one (median window FOV): tan(nominal/2) / tan(est/2);
+    > 1 = zoomed in. NaN without the run."""
+    if not path.is_file():
+        return float('nan')
+    z = np.load(path)
+    return float(np.tan(np.radians(float(z['nominal_hfov_deg'])) / 2) / np.tan(np.radians(float(np.median(z['window_hfov_deg']))) / 2))
+
+
 def heading_from(path, frame_times, sigma_s):
     """Heading of one pose npz (e.g. VGGT/Pi3X) at every frame, or None if missing/unusable."""
     if path is None or not path.is_file():
@@ -283,6 +292,8 @@ def main(argv=None):
     ap.add_argument('--vggt-sigma', type=float, help='heading smoothing sigma (s) for the --vggt source (default --sigma)')
     ap.add_argument('--max-yaw-rate', help='R or MODE=R,...: limit the path heading rate to R deg/s (physical prior)')
     ap.add_argument('--max-accel', help='A or MODE=A,...: limit speed change to A x median speed per s (physical prior)')
+    ap.add_argument('--zoom-yaw-scale', help='MODE=K,T: on clips of MODE whose first --vggt run (Pi3X) estimates a focal length > T x '
+                                              'the nominal one (zoomed in), multiply that mode\'s --yaw-scale by K')
     ap.add_argument('--yaw-scale', default='1.0',
                     help='K or MODE=K,MODE=K: multiply the --vggt heading change by K (per camera mode)')
     ap.add_argument('--tiebreak', type=Path, help='third heading source run dir (e.g. Pi3X): decides a firing switch')
@@ -313,9 +324,21 @@ def main(argv=None):
                     for s in args.vggt_weights or []}
     if vggt_weights and (args.vggt_combine != 'mean' or any(len(w) != len(args.vggt or []) for w in vggt_weights.values())):
         ap.error('--vggt-weights needs --vggt-combine mean and one weight per --vggt run')
+    zoom = None
+    if args.zoom_yaw_scale:
+        zm, zv = args.zoom_yaw_scale.split('=')
+        zoom = (zm, *(float(x) for x in zv.split(',')))
+        if not args.vggt:
+            ap.error('--zoom-yaw-scale needs --vggt (the first run gives the focal estimate)')
     records = {}
     for clip in selected:
         key = clip['key']
+        ys = yaw_scales.get(clip['camera_mode'], yaw_scales.get('*', 1.0))
+        zoom_info = {}
+        if zoom is not None and clip['camera_mode'] == zoom[0]:
+            fs = pi3x_focal_scale(args.vggt[0] / 'poses' / f'{key}.npz')
+            zoom_info = dict(zoom_focal_scale=fs, zoom_yaw_scale=zoom[1] if fs > zoom[2] else 1.0)
+            ys *= zoom_info['zoom_yaw_scale']
         pose_paths = [d / 'poses' / f'{key}.npz' for d in args.poses or []]
         use_speed = args.speed is not None and clip['camera_mode'] in args.speed_modes.split(',')
         use_switch = args.vggt is not None and clip['camera_mode'] in args.switch_modes.split(',')
@@ -335,10 +358,11 @@ def main(argv=None):
                                   args.referee_margin, args.referee_label,
                                   [d / 'poses' / f'{key}.npz' for d in (args.agree_a, args.agree_b)]
                                   if agree_rule and clip['camera_mode'] in args.agree_modes.split(',') else None,
-                                  agree_rule, yaw_scales.get(clip['camera_mode'], yaw_scales.get('*', 1.0)),
+                                  agree_rule, ys,
                                   args.vggt_sigma, per_mode(args.max_yaw_rate, clip['camera_mode']),
                                   per_mode(args.max_accel, clip['camera_mode']), args.vggt_combine,
                                   vggt_weights.get(clip['camera_mode'], vggt_weights.get('*')))
+        info.update(zoom_info)
         write_json(args.output / 'predictions' / f'{key}.json', pred)
         final = info.pop('_final', None)
         if args.save_heading and final is not None:
@@ -358,7 +382,7 @@ def main(argv=None):
                     fm_speed=str(args.fm_speed) if args.fm_speed else None,
                     referee=str(args.referee) if args.referee else None,
                     agree_rule=list(agree_rule) if agree_rule else None,
-                    yaw_scale=yaw_scales if args.vggt else None,
+                    yaw_scale=yaw_scales if args.vggt else None, zoom_yaw_scale=args.zoom_yaw_scale,
                     vggt_combine=args.vggt_combine if args.vggt and len(args.vggt) > 1 else None,
                     vggt_weights=vggt_weights or None,
                     max_yaw_rate=args.max_yaw_rate, max_accel=args.max_accel,

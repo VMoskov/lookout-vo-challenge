@@ -998,6 +998,57 @@ def saved_heading_compare(root, clips, dirs, workers=8):
     return '\n'.join(L), rows
 
 
+ZK_K = [0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9]
+ZK_T = [1.3, 1.35, 1.4, 1.45, 1.5, 1.55, 1.6]
+
+
+def _zoomk_clip(args):
+    """One clip: drift of the saved final heading (make_predictions --save-heading) scaled by each k (saved speed), the
+    turn ratio of the saved heading vs the true heading (total turn and least-squares slope), Pi3X focal scale."""
+    from make_predictions import pi3x_focal_scale
+    from common import total_turn_deg
+    root, clip, base_dir, pi3x_dir = args
+    k = clip['key']
+    data = speed_clip_data(root, clip, None, [])
+    z = np.load(base_dir / 'heading' / f'{k}.npz')
+    h, sp = z['heading'], z['speed']
+    th = np.unwrap(data['thf'])
+    tt, hh = th - th[0], np.unwrap(h) - np.unwrap(h)[0]
+    return dict(key=k, split=clip['split'], focal=pi3x_focal_scale(pi3x_dir / 'poses' / f'{k}.npz'),
+                turn_ratio=total_turn_deg(h) / total_turn_deg(th), slope=float((hh @ tt) / (tt @ tt)),
+                base=_score_speed(data, h, sp), drift={kk: _score_speed(data, kk * h, sp) for kk in ZK_K})
+
+
+def zoomk_tune(root, clips, base_dir, pi3x_dir, workers=8):
+    """Zoom-aware flir-VIS yaw scale: k on flir-VIS clips whose Pi3X focal > T x nominal. Fit (k, T) on the TRAIN mean
+    (all train clips; others keep the base drift from results.json). Returns (text, per-clip rows, best)."""
+    from concurrent.futures import ProcessPoolExecutor
+    fv = [c for c in clips if c['camera_mode'] == 'flir-VIS' and (base_dir / 'heading' / f"{c['key']}.npz").is_file()]
+    with ProcessPoolExecutor(workers) as ex:
+        rows = list(ex.map(_zoomk_clip, [(root, c, base_dir, pi3x_dir) for c in fv]))
+    res = {r['key']: r for r in json.loads((base_dir / 'results.json').read_text())}
+    fvk = {r['key'] for r in rows}
+    other = {s: [r['drift_pct'] for k, r in res.items() if k not in fvk and r['split'] == s] for s in ('train', 'val')}
+    grid = []
+    for kk in ZK_K:
+        for T in ZK_T:
+            m = {s: float(np.mean([r['drift'][kk] if r['focal'] > T else r['base'] for r in rows if r['split'] == s] + other[s]))
+                 for s in ('train', 'val')}
+            grid.append(dict(k=kk, T=T, train=m['train'], val=m['val'], n=sum(r['focal'] > T for r in rows)))
+    base = {s: float(np.mean([r['base'] for r in rows if r['split'] == s] + other[s])) for s in ('train', 'val')}
+    best = min(grid, key=lambda g: (round(g['train'], 6), g['n'], -g['T']))
+    L = [f"base (k = 1): train {base['train']:.3f}, val {base['val']:.3f}",
+         f"best on train: k {best['k']}, T {best['T']} -> train {best['train']:.3f}, val {best['val']:.3f}, {best['n']} flir-VIS clips scaled", '',
+         'train mean by k (rows) and T (columns):', 'k     ' + ''.join(f'{T:>8}' for T in ZK_T)]
+    for kk in ZK_K:
+        L.append(f'{kk:<6}' + ''.join(f"{g['train']:>8.3f}" for g in grid if g['k'] == kk))
+    L += ['', f"{'clip':<9}{'split':<6}{'focal':>7}{'turn ratio':>11}{'slope':>7}{'k=1':>8}" + ''.join(f'{kk:>7}' for kk in ZK_K)]
+    for r in rows:
+        L.append(f"{r['key']:<9}{r['split']:<6}{r['focal']:>7.2f}{r['turn_ratio']:>11.2f}{r['slope']:>7.2f}{r['base']:>8.2f}"
+                 + ''.join(f"{r['drift'][kk]:>7.2f}" for kk in ZK_K))
+    return '\n'.join(L), rows, dict(best, base_train=base['train'], base_val=base['val'])
+
+
 def compare_runs_heading(root, clips, runs, params, workers=8):
     """Single DPVO runs side by side (label -> (pose dir, flow speed dir or None)): heading only
     (run heading + true speed) and pipeline (run heading + filtered flow speed, else constant)."""
@@ -1393,6 +1444,8 @@ def main(argv=None):
                     help='LABEL=POSEDIR[+POSEDIR...][:SPEEDDIR]; several pose dirs = circular-median heading (first = base)')
     ap.add_argument('--saved-heading', nargs='+', help='LABEL=PRED_DIR (make_predictions --save-heading): heading-only '
                                                        '(saved heading + true speed) and submitted drift per clip; first = base')
+    ap.add_argument('--zoomk-tune', nargs=2, metavar=('BASE_DEV_DIR', 'PI3X_DIR'),
+                    help='fit the zoom-aware flir-VIS yaw scale (k, T) on TRAIN from BASE_DEV_DIR saved headings')
     ap.add_argument('--zoom-analysis', action='store_true', help='flir-VIS focal: why the residual detector works or not')
     ap.add_argument('--focal-base', type=Path, nargs='+', help='focal report: base run dirs (e.g. 3 seeds at x1.0)')
     ap.add_argument('--focal-new', type=Path, nargs='+', help='focal report: run dirs at the new focal scale')
@@ -1438,6 +1491,14 @@ def main(argv=None):
         args.output.mkdir(parents=True, exist_ok=True)
         write_csv(args.output / 'combo.csv', rows)
         (args.output / 'combo.txt').write_text(text + '\n')
+        print(text)
+        return 0
+    if args.zoomk_tune:
+        text, rows, best = zoomk_tune(root, selected, REPO_ROOT / args.zoomk_tune[0], REPO_ROOT / args.zoomk_tune[1], args.workers)
+        args.output.mkdir(parents=True, exist_ok=True)
+        (args.output / 'zoomk.txt').write_text(text + '\n')
+        write_json(args.output / 'zoomk_best.json', best)
+        write_csv(args.output / 'zoomk_clips.csv', [{k: v for k, v in r.items() if k != 'drift'} for r in rows])
         print(text)
         return 0
     if args.saved_heading:
