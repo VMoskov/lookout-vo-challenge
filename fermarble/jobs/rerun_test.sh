@@ -3,7 +3,7 @@
 # with the crops of runs/static-regions/crops_v2.json, then final_entry.sh on those runs. Settings as in the runs
 # behind the entry:
 #   DPVO 8 fps seeds 0/1/2, plus a CLAHE run of the thermal clips per seed
-#   Pi3X w24 uncropped and cropped, Pi3X w32 (cropped), VGGT: no keyframe CLAHE (they ran before it existed)
+#   Pi3X w24 uncropped and cropped, Pi3X w32 (cropped), VGGT; keyframe CLAHE on thermal clips (the default)
 #   Omega 512 (cropped, keyframe CLAHE on thermal clips, as when it ran)
 #   PanSR segmentation; flow on the seed-0 DPVO run, variants mask and mask+hs0 (the ones the fitted speed fix uses)
 #   speed fix hs+near from the fitted candidate runs/speedfix/tune-vwwide/speedfix_best.json (not re-fitted)
@@ -37,10 +37,10 @@ gpu "PanSR segmentation" $R/seg-pansr $PS fermarble/seg_run.py --dataset $TEST -
 FLOW=$!
 for s in 1 2; do gpu "DPVO seed $s" $R/dpvo-seed$s $PY fermarble/run_dpvo.py --dataset $TEST --split test --seed $s; done
 for s in 0 1 2; do gpu "DPVO seed $s CLAHE" $R/dpvo-seed$s-clahe $PY fermarble/run_dpvo.py --dataset $TEST --clips $THERMAL --seed $s --clahe; done
-gpu "Pi3X w24" $R/pi3x $PI fermarble/pi3_tool.py --dataset $TEST --split test --no-clahe
-gpu "Pi3X w24 cropped" $R/pi3x-crop $PI fermarble/pi3_tool.py --dataset $TEST --clips $CROPPED --crops $C --no-clahe
-gpu "Pi3X w32" $R/pi3x-w32 $PI fermarble/pi3_tool.py --dataset $TEST --split test --window 32 --crops $C --no-clahe
-gpu "VGGT" $R/vggt $VG fermarble/vggt_tool.py --dataset $TEST --split test --no-clahe
+gpu "Pi3X w24" $R/pi3x $PI fermarble/pi3_tool.py --dataset $TEST --split test
+gpu "Pi3X w24 cropped" $R/pi3x-crop $PI fermarble/pi3_tool.py --dataset $TEST --clips $CROPPED --crops $C
+gpu "Pi3X w32" $R/pi3x-w32 $PI fermarble/pi3_tool.py --dataset $TEST --split test --window 32 --crops $C
+gpu "VGGT" $R/vggt $VG fermarble/vggt_tool.py --dataset $TEST --split test
 gpu "Omega" $R/omega512 $VG fermarble/omega_tool.py --dataset $TEST --split test --crops $C
 wait $FLOW
 log "speed fix"
