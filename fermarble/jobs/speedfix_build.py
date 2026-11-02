@@ -25,6 +25,9 @@ def main():
     ap.add_argument('--best', required=True, type=Path)
     ap.add_argument('--family', required=True)
     ap.add_argument('--output', required=True)
+    ap.add_argument('--flow', nargs='+', metavar='SPLIT=PREFIX',
+                    help='flow_speed.py output prefix per split (default: ' + ' '.join(f'{k}={v}' for k, v in PREFIX.items())
+                         + '); only the splits given are built')
     args = ap.parse_args()
     b = json.loads(args.best.read_text())[args.family]
     params = json.loads(V3A.read_text())
@@ -32,7 +35,8 @@ def main():
         params.update(near_w=float(b['near_w']), near_reliable=b['near_reliable'] in (True, 'True'))
     write_json(Path(f'{args.output}.params.json'), params)
     fires = {}
-    for split, prefix in PREFIX.items():
+    prefixes = dict(a.split('=', 1) for a in args.flow) if args.flow else PREFIX
+    for split, prefix in prefixes.items():
         out = Path(f'{args.output}-{split}') / 'speed'
         out.mkdir(parents=True, exist_ok=True)
         for f in sorted(Path(f"{prefix}-{b['flow']}/speed").glob('*.npz')):
@@ -46,7 +50,7 @@ def main():
             np.savez(out / f.name, **d)
     write_json(Path(f'{args.output}.fires.json'), fires)
     print(args.family, b['label'], 'clips where the rule fires:',
-          {s: [k for k, v in fires.items() if v['split'] == s and v['replaced'] > 0] for s in PREFIX})
+          {s: [k for k, v in fires.items() if v['split'] == s and v['replaced'] > 0] for s in prefixes})
 
 
 if __name__ == '__main__':
