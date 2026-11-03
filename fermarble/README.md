@@ -12,11 +12,18 @@ are the official ones.
 | `oracle.py` | Train/val only, the only reader of references: scores 9 heading/speed variants with the starter metric. |
 | `selftest.py` | Synthetic end-to-end test, no video/GPU: fake poses → run_dpvo (faked tracker) → make_predictions (references hidden) → starter evaluate.py + pack_submission.py → oracle. |
 
-## Environment (GPU)
+## Installation
 
-- DPVO pinned clone: `../../DPVO-859bbbf` (commit 859bbbf, `dpvo.pth` sha256 verified). This is the default `DPVO_DIR`.
-- micromamba env `dpvo` (`~/micromamba/envs/dpvo`): Python 3.10, torch 2.5.1+cu121, torch-scatter, opencv-python 4.10.0.84, numpy 1.26.4, conda-forge CUDA 12.1 nvcc/headers.
-- DPVO build (system nvcc is CUDA 13, so use the env's 12.1 and gcc-12):
+The code expects the external checkouts next to the repository (the commits are listed in the factsheet,
+`factsheet/main.tex`): `../DPVO-859bbbf`, `../Pi3`, `../vggt`, `../vggt-omega`, `../PanSR`. The four
+environments come from the lock files in `envs/` (`dpvo` and `pansr`: micromamba; `pi3` and `vggt`: uv venvs).
+DPVO, PanSR and VGGT are not on PyPI, so their entries in the lock files are commented out or Git URLs; install
+them from the checkouts as below. Pi3 and vggt-omega are not installed: `pi3_tool.py` and `omega_tool.py` add the
+checkouts to `sys.path` (`PI3_DIR`, default `../Pi3`; `VGGT_OMEGA_DIR`, default `../vggt-omega`).
+
+- DPVO (`dpvo` env; Python 3.10, torch 2.5.1+cu121, torch-scatter, opencv-python 4.10.0.84, numpy 1.26.4,
+  conda-forge CUDA 12.1 nvcc/headers). Built from the checkout with its CUDA extensions; installed with
+  `pip install .` (not editable). The system nvcc is CUDA 13, so use the env's 12.1 and gcc-12; from `../DPVO-859bbbf`:
 
 ```bash
 P=~/micromamba/envs/dpvo; T=$P/targets/x86_64-linux
@@ -25,6 +32,41 @@ CUDA_HOME=$P PATH=$P/bin:$PATH CC=gcc-12 CXX=g++-12 NVCC_PREPEND_FLAGS="-ccbin g
   TORCH_CUDA_ARCH_LIST=8.9 CPATH=$T/include LIBRARY_PATH=$T/lib:$P/lib \
   $P/bin/python -m pip install --no-build-isolation .
 ```
+
+  Weights: `dpvo.pth` from the authors' `models.zip` (`download_models_and_data.sh` in the checkout), placed in
+  `../DPVO-859bbbf/` (the default `DPVO_DIR`).
+- PanSR (`pansr` env; Python 3.10, torch 2.4.1+cu124): editable install from the checkout, following PanSR's
+  README (detectron2 from source at commit b0fe2f0, then PanSR, then its CUDA op); from `../PanSR`:
+
+```bash
+PY=~/micromamba/envs/pansr/bin/python
+$PY -m pip install --no-build-isolation 'git+https://github.com/facebookresearch/detectron2.git@b0fe2f0a5bb6496f65246ef35687a386a9f19202'
+$PY -m pip install -e .
+( cd pansr/modeling/pixel_decoder/ops && FORCE_CUDA=1 $PY setup.py build install )   # MultiScaleDeformableAttention
+```
+
+- VGGT (`vggt` venv): editable install from the checkout,
+  `uv pip install --python ~/venvs/vggt/bin/python -e ../vggt`.
+- Checkpoints: Pi3X, VGGT-1B and PanSR are downloaded from Hugging Face on first use. The VGGT-Ω checkpoint
+  (`facebook/VGGT-Omega`, `vggt_omega_1b_512.pt`) is gated on Hugging Face: the organizers need to request
+  access at https://huggingface.co/facebook/VGGT-Omega, download it and set `OMEGA_CKPT` to its path.
+
+The installation was tested on our machine; a clean-machine install has not been verified.
+
+## Rebuilding the final entry
+
+`release/final-entry-model-outputs.tar.gz` holds the model outputs the final entry (#19444, sha256
+f5e36116...) was built from: DPVO, Pi3X, VGGT and VGGT-Ω poses, speed-fix speeds, fitted parameters and crops
+(16.4 MB, sha256 aa11426667cd3e8eea905b1277b1c43ca3bdafdd1416f151252b37aa1cc5a17d). From the repository root,
+with the released test package at `lookout-vo-test-v0.1/`, only the `dpvo` env is needed:
+
+```bash
+tar -xzf fermarble/release/final-entry-model-outputs.tar.gz   # -> runs/
+OUT=runs/final-entry-v2 bash fermarble/jobs/final_entry.sh    # prints the sha256 and compares it with the entry
+```
+
+The full pipeline from the videos is `fermarble/jobs/rerun_test.sh` (about 4 h on one RTX 4070 Ti SUPER; not
+bit-exact, because DPVO's CUDA kernels are nondeterministic).
 
 ## Run (from the repository root)
 
