@@ -1,16 +1,40 @@
-# fermarble
+# UNIZG FER LABUST / MARBLE: MaCVi 2027 Maritime VO, final entry #19444
 
-DPVO heading + constant-speed prior for Maritime Visual Odometry. Imports the unmodified
-`starter/` (tracking, public_dataset, metrics, evaluate) so loading, format checks and scoring
-are the official ones.
+Vedran Moškov¹, Matej Fabijanić², Fausto Ferreira²,¹
 
-| File | Role |
-|---|---|
-| `common.py` | Starter imports, pose geometry, heading + constant-speed model, fallback. Never reads references. |
-| `run_dpvo.py` | GPU: `tracking.track()` per clip → `poses/<clip>.npz` (full N×7 camera-to-world poses, frame indices, times) + raw starter-format predictions. Resumable. |
-| `make_predictions.py` | CPU: npz → predictions at every released frame (straight-line fallback). Never reads references. |
-| `oracle.py` | Train/val only, the only reader of references: scores 9 heading/speed variants with the starter metric. |
-| `selftest.py` | Synthetic end-to-end test, no video/GPU: fake poses → run_dpvo (faked tracker) → make_predictions (references hidden) → starter evaluate.py + pack_submission.py → oracle. |
+¹ CoE MARBLE - Centre of Excellence in Maritime Robotics and Technologies for Sustainable Blue Economy, Zagreb, Croatia<br>
+² University of Zagreb Faculty of Electrical Engineering and Computing, Zagreb, Croatia
+
+Contact: vedran.moskov@marble.eu
+
+**Citation:** If you use this code, please cite the MaCVi 2027 challenge summary paper (to appear).
+
+Our solution to the MaCVi 2027 Maritime VO challenge (11.02 % mean drift): heading and speed integrated per frame.
+- **Heading** by camera type from chained camera rotations on 2 fps keyframes: wide = circular mean of Pi3X
+  (windows of 24 and 32) and VGGT-Ω, 1/3 each, yaw x0.95; flir-VIS and flir-IR = VGGT-Ω.
+- **Speed** from DIS optical flow on the water (PanSR mask), water-plane fit with horizon-sanity correction,
+  filtered and gated per clip; constant speed as fallback (flir-IR, unreliable or non-varying flow).
+- **Own-vessel crop** (3-35 % of the frame height) on the Pi3X and VGGT-Ω keyframes; **CLAHE** on thermal frames.
+- **DPVO** (3 seeds, 8 fps) gives the camera rotation that derotates the flow, and the horizon.
+
+Full details (method, data, reproduction, checkpoints): [`factsheet/`](../factsheet/) (`main.pdf`).
+
+## Credits and licences
+
+Built on the organizers' starter kit, https://github.com/LOOKOUT-AI/lookout-vo-challenge (MIT License).
+`starter/` is unmodified; `fermarble/` imports it for decoding, preprocessing, DPVO tracking, format checks and
+scoring. External code and weights keep their own licences:
+
+| Component | Code | Weights |
+|---|---|---|
+| DPVO (princeton-vl/DPVO) | MIT | `dpvo.pth` from the authors' `models.zip` |
+| Pi3 / Pi3X (yyfz/Pi3) | BSD 3-Clause | Pi3X: CC BY-NC 4.0 |
+| VGGT-Ω (facebookresearch/vggt-omega) | FAIR Noncommercial Research License | FAIR Noncommercial Research License (gated) |
+| VGGT (facebookresearch/vggt) | VGGT License | original VGGT-1B checkpoint: non-commercial |
+| PanSR (lojzezust/PanSR) | Apache-2.0 | not documented by the authors |
+| Detectron2 | Apache-2.0 | - |
+
+The challenge dataset is CC BY-NC 4.0 (see the root README).
 
 ## Installation
 
@@ -32,6 +56,10 @@ CUDA_HOME=$P PATH=$P/bin:$PATH CC=gcc-12 CXX=g++-12 NVCC_PREPEND_FLAGS="-ccbin g
   TORCH_CUDA_ARCH_LIST=8.9 CPATH=$T/include LIBRARY_PATH=$T/lib:$P/lib \
   $P/bin/python -m pip install --no-build-isolation .
 ```
+
+  `TORCH_CUDA_ARCH_LIST=8.9` targets RTX 40-series GPUs (Ada); set it to your GPU's compute capability
+  (e.g. 8.6 for RTX 30-series, 9.0 for H100). The Eigen symlink needs the system Eigen headers
+  (`sudo apt install libeigen3-dev`, which provides `/usr/include/eigen3`).
 
   Weights: `dpvo.pth` from the authors' `models.zip` (`download_models_and_data.sh` in the checkout), placed in
   `../DPVO-859bbbf/` (the default `DPVO_DIR`).
@@ -65,10 +93,61 @@ tar -xzf fermarble/release/final-entry-model-outputs.tar.gz   # -> runs/
 OUT=runs/final-entry-v2 bash fermarble/jobs/final_entry.sh    # prints the sha256 and compares it with the entry
 ```
 
-The full pipeline from the videos is `fermarble/jobs/rerun_test.sh` (about 4 h on one RTX 4070 Ti SUPER; not
-bit-exact, because DPVO's CUDA kernels are nondeterministic).
+## Full pipeline from the videos
 
-## Run (from the repository root)
+From the repository root, with the development release at `release/` and the test package at
+`lookout-vo-test-v0.1/` (the own-vessel detector reads both), all four environments and the VGGT-Ω checkpoint:
+
+```bash
+export OMEGA_CKPT=/path/to/vggt_omega_1b_512.pt
+PY=~/micromamba/envs/dpvo/bin/python
+$PY fermarble/jobs/static_regions.py                                        # own-vessel detector
+$PY fermarble/jobs/select_crops.py --output runs/static-regions/crops_v2.json
+bash fermarble/jobs/rerun_test.sh > runs/rerun-test.log 2>&1                # -> runs/rerun-test/final/submission_test.json
+```
+
+`rerun_test.sh` runs DPVO (seeds 0/1/2, plus CLAHE runs of thermal clips), PanSR, the flow, Pi3X (w24
+uncropped and cropped, w32), VGGT and VGGT-Ω one GPU stage at a time, builds the speed fix from the fitted
+parameters and calls `final_entry.sh`. It takes about 4 h on one RTX 4070 Ti SUPER and is not bit-exact, because
+DPVO's CUDA kernels are nondeterministic (the other stages reproduce byte for byte); the rebuild above is.
+
+## File overview
+
+Used by the final entry:
+
+| File | Role |
+|---|---|
+| `run_dpvo.py` | GPU: DPVO through the starter's `tracking.track()` per clip at 8 fps; full camera-to-world poses → `poses/<clip>.npz`. Resumable. `--clahe` for thermal clips. |
+| `thermal.py` | CLAHE (clip limit 2.0, 8x8 tiles) on thermal frames, inside the starter's decoder process (DPVO) and on keyframes. |
+| `seg_run.py` | GPU, `pansr` env: PanSR (LaRS, Swin-L) water segmentation of the frames the flow uses. |
+| `flow_speed.py` | CPU: DIS optical flow on the water, derotated with DPVO's rotation, water-plane fit in near/far bands, horizon-sanity variants → per-frame speed. |
+| `vggt_tool.py` | GPU, `vggt` env: 2 fps keyframes (own-vessel crop, CLAHE on thermal), windows with overlap, chained rotations; VGGT-1B (weight 0 in the final entry). Shared keyframe and window code for the two tools below. |
+| `pi3_tool.py` | GPU, `pi3` env: Pi3X on the same keyframes and windows (24 and 32 keyframes). |
+| `omega_tool.py` | GPU, `vggt` env: VGGT-Ω 1B-512 camera head on the same keyframes and windows (`OMEGA_CKPT`). |
+| `common.py` | Pose geometry, heading, speed filter and gate, horizon-sanity merge, path integration. Never reads references. |
+| `make_predictions.py` | CPU: heading by camera type and speed → starter-format predictions at every frame. Never reads references. |
+| `jobs/static_regions.py` | CPU: own-vessel detector (persistent bottom edges) → `runs/static-regions/static_regions.csv`. |
+| `jobs/select_crops.py` | Crops from the detector output: every clip with a bottom crop of 3-35 % of the height. |
+| `jobs/merge_runs.py` | Per-clip choice between two runs by rule: CLAHE DPVO run for thermal camera modes, cropped Pi3X run for cropped clips. |
+| `jobs/speedfix_build.py` | Speed-fix speeds (flow merged with its horizon-sanity variant) from the parameters fitted on train. |
+| `jobs/final_entry.sh` | Builds and packs the final entry from the model runs; checks the sha256 against the submitted bundle. |
+| `jobs/rerun_test.sh` | Full test pipeline from the videos (all stages above), then `final_entry.sh`. |
+| `envs/` | Dependency lock files of the four environments. |
+| `release/` | Cached model outputs for the bit-exact rebuild. |
+
+Development tools (dev evaluation and experiments, not needed for the final entry):
+
+| File | Role |
+|---|---|
+| `oracle.py` | Train/val only, the only reader of references: scores heading/speed variants with the starter metric and fits the filter, gate and speed-fix parameters on train. |
+| `selftest.py` | Synthetic end-to-end test, no video/GPU: fake poses → run_dpvo (faked tracker) → make_predictions (references hidden) → starter evaluate.py + pack_submission.py → oracle. |
+| `compare_runs.py` | Side-by-side mean/median drift of evaluated runs. |
+| `overlay.py`, `gated_flow.py`, `rot_ba.py` | Experiments: HUD overlay inpainting for DPVO, gated segmentation flow, rotation bundle adjustment. |
+| other `jobs/` scripts | Experiment and evaluation jobs from development. |
+
+## Development notes
+
+### Early DPVO pipeline (from the repository root)
 
 ```bash
 PY=~/micromamba/envs/dpvo/bin/python
@@ -79,7 +158,7 @@ $PY starter/evaluate.py --dataset release/release_manifest.json --split train,va
 $PY fermarble/oracle.py --split train,val --poses runs/dpvo-fps8-seed0 --predictions runs/heading --output runs/oracle
 ```
 
-## Heading convention
+### Heading convention
 
 0 deg is the direction the camera faced at the start: the mean flattened camera forward over the
 first 3 s of poses (`START_WINDOW_S`), averaged over a window because DPVO's first frames are noisy.
@@ -90,7 +169,7 @@ Integrated paths are right-handed with bearing 0 along +y and 90 deg along +x. C
 this frame. The metric's global Sim(3) removes any constant heading offset, so the reference changes
 readability only, not scores.
 
-## Pose convention
+### Pose convention
 
 `slam.terminate()` inverts DPVO's internal world-to-camera poses, so rows are camera-to-world
 `tx ty tz qx qy qz qw`. Heading scores alone cannot confirm this: inverting a mostly-yawing
@@ -98,7 +177,7 @@ pose mirrors the heading, and a 3-D Sim(3) undoes a mirror of a planar path. The
 reports `fwd_cos`: the median cosine between DPVO's translation direction and camera +z. It is
 about +1 for the right convention.
 
-## flir-VIS focal length (x2.0 for all clips REJECTED on test)
+### flir-VIS focal length (x2.0 for all clips REJECTED on test)
 
 > **Test result (leaderboard):** `submission_test_flow_focal_v2.json` (x2.0 on all flir-VIS, x1.0
 > fallback) scored **18.99 %**, worse than `submission_test_flow.json` (x1.0 med3 + flow, **17.94 %**,
@@ -133,7 +212,7 @@ about +1 for the right convention.
   ground-truth-free fallback to x1.0 when every x2.0 seed of a clip has NaN poses and an x1.0 seed is
   intact (clip_096, clip_104).
 
-## Rejected options (dev evaluation)
+### Rejected options (dev evaluation)
 
 - `run_dpvo.py --patch-strategy GRADIENT_BIAS` (DPVO's textured-patch sampling): on the 67 wide clips within
   seed noise (heading-only mean 9.25 -> 9.43 %, median 4.68 -> 3.62 %) with a few large failures

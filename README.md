@@ -1,3 +1,12 @@
+# UNIZG FER LABUST / MARBLE solution
+
+This fork contains our solution to the MaCVi 2027 Maritime Visual Odometry challenge (final entry #19444):
+see [`fermarble/README.md`](fermarble/README.md) for the method summary, installation, the bit-exact rebuild
+of the entry and the full pipeline, and [`factsheet/`](factsheet/) for the factsheet. Everything below this
+section is the organizers' starter README, unchanged.
+
+---
+
 # Maritime Visual Odometry
 
 Estimate a boat-mounted camera's trajectory from RGB or thermal video, calibration
