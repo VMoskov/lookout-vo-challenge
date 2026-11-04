@@ -57,7 +57,7 @@ $^{2}$University of Zagreb Faculty of Electrical Engineering and Computing, Zagr
   \item \textbf{Final entry (the upload selected as final entry in the dashboard):} submission ID 19444 (model name
     \texttt{med3-flow-pi3x-omega-ir}, 28~October~2026), uploaded by user ID 392, score shown on the leaderboard
     11.02\,\% (mean relative-position drift, \% of segment length)
-  \item \textbf{Code repository and model weights:} \url{https://github.com/VMoskov/lookout-vo-challenge}, branch \texttt{fermarble-history},
+  \item \textbf{Code repository and model weights:} \url{https://github.com/VMoskov/lookout-vo-challenge}, branch \texttt{fermarble},
     public, no expiry. The weights are the unmodified public checkpoints listed in
     Section~\ref{sec:repro}: \texttt{dpvo.pth} comes from the DPVO authors' \texttt{models.zip}, Pi3X, VGGT-1B
     and PanSR are downloaded from Hugging Face by the code, and VGGT-$\Omega$ requires gated access
@@ -390,7 +390,7 @@ Give the training details once, in Section~\ref{sec:method}; do not repeat them 
   \item \textbf{Installation commands:} from the parent directory of the repository (the code expects the external
     checkouts next to it):
 {\footnotesize\begin{verbatim}
-git clone -b fermarble-history \
+git clone -b fermarble \
     https://github.com/VMoskov/lookout-vo-challenge.git
 git clone https://github.com/princeton-vl/DPVO.git DPVO-859bbbf
 git -C DPVO-859bbbf checkout 859bbbfdac6c
