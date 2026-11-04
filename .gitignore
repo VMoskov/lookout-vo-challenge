@@ -8,3 +8,6 @@ videos/
 references/
 timing/
 release_manifest.json
+
+# organizers' factsheet template (kept locally, not in the repo)
+factsheet/template/
