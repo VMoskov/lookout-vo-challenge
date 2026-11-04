@@ -470,9 +470,10 @@ OUT=runs/final-entry-v2 bash fermarble/jobs/final_entry.sh
     11.02\,\%); we recommend this path for verification. Observed variation of full reruns (fresh DPVO, everything
     downstream recomputed):
     \begin{itemize}[nosep]
-      \item Test: 13 fresh runs differ from the submitted bundle by $2.16\pm0.48$ drift points (range 1.56--3.01;
-        mean over the 20 clips, starter metric with the submitted bundle as the reference trajectories; distances
-        between predictions, not scores). 16 of the 20 clips never switched speed mode. Clip~107 used flow speed in
+      \item Test: 13 fresh runs differ from the submitted bundle by $2.16\pm0.48$ drift points (range 1.56--3.01),
+        measured with the official metric using the submitted bundle as the reference. This is an absolute deviation:
+        it measures how much the predictions differ, in either direction, not whether a rerun scores better or worse.
+        16 of the 20 clips never switched speed mode. Clip~107 used flow speed in
         12 of 13 reruns but constant speed in the submitted run, so the submitted run is atypical on that clip; 092
         and 094 switched to constant speed in 3 and 4 of 13 runs, 109 in one.
       \item Val (ground truth, official evaluator): 6 fresh runs scored $10.60\pm1.40$\,\% (range 9.45--13.33) against
