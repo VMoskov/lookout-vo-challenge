@@ -459,7 +459,7 @@ OUT=runs/final-entry-v2 bash fermarble/jobs/final_entry.sh
     seeds PyTorch and NumPy); the other stages have no random sampling at inference. A full rerun is not bit-exact:
     DPVO's CUDA kernels are nondeterministic (two back-to-back runs with the same seed and code differ), while Pi3X
     (w24 uncropped and cropped, w32), VGGT, VGGT-$\Omega$ and the PanSR masks were byte-identical on all 20 test clips in
-    the full rerun of 2~November~2026.\footnote{That rerun first passed \texttt{--no-clahe} to Pi3X and VGGT by
+    the full rerun of 2~November~2026.\footnote{That rerun first passed \texttt{-{}-no-clahe} to Pi3X and VGGT by
     mistake; their run of the thermal clip~100 was repeated with keyframe CLAHE, as in the entry, and is
     byte-identical. Fixed in commit \texttt{eb83195}.} DPVO does not reach the heading of the test clips; it reaches the output only
     through the flow-based speed (rotation and horizon) of the wide and flir-VIS clips. Most of the variation comes
