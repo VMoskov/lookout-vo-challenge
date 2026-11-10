@@ -9,8 +9,8 @@ Same keyframes, windows, chaining and output format as vggt_tool.py (only the pe
 make_predictions.py --vggt and the oracle take an Omega run directory unchanged. Keyframes are resized to
 OMEGA_WIDTH px wide (about Omega's 512^2-token budget at 16 px patches) and centre-cropped to a multiple of 16 rows.
 Run with the VGGT environment (~/venvs/vggt/bin/python) from the repository root; the vggt-omega checkout
-(github.com/facebookresearch/vggt-omega) is found through VGGT_OMEGA_DIR (default ../vggt-omega) and the checkpoint
-through OMEGA_CKPT. Never reads references.
+(github.com/facebookresearch/vggt-omega) is found through VGGT_OMEGA_DIR (bundled checkout, sibling fallback)
+and the official checkpoint through OMEGA_CKPT (default portable/checkpoints/omega/). Never reads references.
 """
 from __future__ import annotations
 import os
@@ -23,9 +23,10 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import vggt_tool  # noqa: E402
 from vggt_tool import build_parser, run_clips  # noqa: E402
+from common import REPO_ROOT, external_checkout  # noqa: E402
 
-OMEGA_DIR = Path(os.environ.get('VGGT_OMEGA_DIR', Path(__file__).resolve().parents[2] / 'vggt-omega'))
-OMEGA_CKPT = Path(os.environ.get('OMEGA_CKPT', '/media/labust/shared3tb_ssd1/macvi5-weights/mapvggt/abl_base_best.safetensors'))
+OMEGA_DIR = Path(os.environ.get('VGGT_OMEGA_DIR', external_checkout('vggt-omega')))
+OMEGA_CKPT = Path(os.environ.get('OMEGA_CKPT', REPO_ROOT / 'portable/checkpoints/omega/vggt_omega_1b_512.pt'))
 OMEGA_WIDTH = 704
 sys.path.insert(0, str(OMEGA_DIR))
 
@@ -33,6 +34,8 @@ sys.path.insert(0, str(OMEGA_DIR))
 def load_model():
     """VGGTOmega (camera head only) with the vggt.* weights of the mapvggt checkpoint (.safetensors) or the official
     Meta state dict (.pt, loaded with weights_only); every aggregator and camera-head weight must be present."""
+    if not OMEGA_CKPT.is_file():
+        raise FileNotFoundError(f'Official Omega checkpoint missing at {OMEGA_CKPT}; set OMEGA_CKPT to its path')
     from vggt_omega.models import VGGTOmega
     if OMEGA_CKPT.suffix == '.pt':
         sd = torch.load(OMEGA_CKPT, map_location='cpu', weights_only=True)

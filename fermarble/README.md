@@ -38,12 +38,13 @@ The challenge dataset is CC BY-NC 4.0 (see the root README).
 
 ## Installation
 
-The code expects the external checkouts next to the repository (the commits are listed in the factsheet,
+The code supports external checkouts next to the repository (the commits are listed in the factsheet,
 `factsheet/main.tex`): `../DPVO-859bbbf`, `../Pi3`, `../vggt`, `../vggt-omega`, `../PanSR`. The four
 environments come from the lock files in `envs/` (`dpvo` and `pansr`: micromamba; `pi3` and `vggt`: uv venvs).
 DPVO, PanSR and VGGT are not on PyPI, so their entries in the lock files are commented out or Git URLs; install
 them from the checkouts as below. Pi3 and vggt-omega are not installed: `pi3_tool.py` and `omega_tool.py` add the
-checkouts to `sys.path` (`PI3_DIR`, default `../Pi3`; `VGGT_OMEGA_DIR`, default `../vggt-omega`).
+checkouts to `sys.path` (`PI3_DIR`, `VGGT_OMEGA_DIR`). Bundled checkouts under
+`portable/checkouts/` now take precedence over the original sibling defaults.
 
 - DPVO (`dpvo` env; Python 3.10, torch 2.5.1+cu121, torch-scatter, opencv-python 4.10.0.84, numpy 1.26.4,
   conda-forge CUDA 12.1 nvcc/headers). Built from the checkout with its CUDA extensions; installed with

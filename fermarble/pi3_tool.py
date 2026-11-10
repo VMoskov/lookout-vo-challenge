@@ -5,7 +5,8 @@ field of view, and chained camera rotations as a heading source.
 Same keyframes, windows, chaining and output format as vggt_tool.py (only the per-window model
 differs), so make_predictions.py --vggt and the oracle take a Pi3X run directory unchanged.
 Run with the Pi3 environment (~/venvs/pi3/bin/python) from the repository root. The Pi3 checkout
-(github.com/yyfz/Pi3) is found through PI3_DIR (default ../Pi3). Never reads references.
+(github.com/yyfz/Pi3) is found through PI3_DIR (bundled portable/checkouts/Pi3, with
+../Pi3 as fallback). Never reads references.
 
 - Poses: Pi3X camera_poses (camera-to-world, OpenCV axes).
 - Focal: Pi3X predicts per-pixel local point maps; their ray directions give fx per frame through
@@ -23,8 +24,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from vggt_tool import build_parser, run_clips  # noqa: E402
+from common import external_checkout  # noqa: E402
 
-PI3_DIR = Path(os.environ.get('PI3_DIR', Path(__file__).resolve().parents[2] / 'Pi3'))
+PI3_DIR = Path(os.environ.get('PI3_DIR', external_checkout('Pi3')))
 sys.path.insert(0, str(PI3_DIR))
 
 

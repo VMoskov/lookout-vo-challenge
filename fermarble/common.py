@@ -17,7 +17,19 @@ FERMARBLE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = FERMARBLE_DIR.parent
 STARTER_DIR = REPO_ROOT / 'starter'
 DEFAULT_DATASET = REPO_ROOT / 'release' / 'release_manifest.json'
-DEFAULT_DPVO_DIR = REPO_ROOT.parent / 'DPVO-859bbbf'  # pinned 859bbbf clone
+
+
+def external_checkout(name):
+    """Prefer bundled model sources; retain the original sibling layout as fallback."""
+    bundled = REPO_ROOT / 'portable' / 'checkouts' / name
+    return bundled if bundled.is_dir() else REPO_ROOT.parent / name
+
+
+DEFAULT_DPVO_DIR = external_checkout('DPVO-859bbbf')  # pinned 859bbbf clone
+BUNDLED_HF_HOME = REPO_ROOT / 'portable' / 'huggingface'
+if (BUNDLED_HF_HOME / 'hub').is_dir():
+    os.environ.setdefault('HF_HOME', str(BUNDLED_HF_HOME))
+    os.environ.setdefault('HF_HUB_CACHE', str(BUNDLED_HF_HOME / 'hub'))
 
 if str(STARTER_DIR) not in sys.path:
     sys.path.insert(0, str(STARTER_DIR))
