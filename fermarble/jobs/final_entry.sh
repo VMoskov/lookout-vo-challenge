@@ -10,7 +10,9 @@
 #   OUT=runs/final-entry-v2 bash fermarble/jobs/final_entry.sh
 set -eu
 cd "$(dirname "$0")/../.."
-PY=$HOME/micromamba/envs/dpvo/bin/python
+source fermarble/jobs/runtime.sh
+PY=$FERMARBLE_DPVO_PYTHON
+fermarble_require_python "$PY" dpvo
 TEST=lookout-vo-test-v0.1/release_manifest.json
 OUT=${OUT:-runs/final-entry-v2}
 CROPS=${CROPS:-runs/static-regions/crops_v2.json}

@@ -12,21 +12,26 @@
 # Start: setsid nohup bash fermarble/jobs/rerun_test.sh > runs/rerun-test.log 2>&1 < /dev/null &
 set -u
 cd "$(dirname "$0")/../.."
-PY=$HOME/micromamba/envs/dpvo/bin/python
-PI=$HOME/venvs/pi3/bin/python
-VG=$HOME/venvs/vggt/bin/python
-PS=$HOME/micromamba/envs/pansr/bin/python
+source fermarble/jobs/runtime.sh
+PY=$FERMARBLE_DPVO_PYTHON
+PI=$FERMARBLE_PI3_PYTHON
+VG=$FERMARBLE_VGGT_PYTHON
+PS=$FERMARBLE_PANSR_PYTHON
+fermarble_require_python "$PY" dpvo || exit 1
+fermarble_require_python "$PI" pi3 || exit 1
+fermarble_require_python "$VG" vggt || exit 1
+fermarble_require_python "$PS" pansr || exit 1
+[ -f "$OMEGA_CKPT" ] || { echo "Missing Omega checkpoint: $OMEGA_CKPT" >&2; exit 1; }
 TEST=lookout-vo-test-v0.1/release_manifest.json
 C=runs/static-regions/crops_v2.json
 R=${R:-runs/rerun-test}
-export OMEGA_CKPT=/media/labust/shared3tb_ssd1/macvi5-weights/vggt-omega-official/vggt_omega_1b_512.pt
 log() { echo "$(date '+%F %T') $*"; }
 gpu() { local name=$1 dir=$2; shift 2; mkdir -p $dir; log "start $name"
   "$@" --output $dir >> $dir/run.log 2>&1 && log "done $name" || log "FAILED $name"; }
 mkdir -p $R
 THERMAL=$($PY -c "import json,sys;sys.path.insert(0,'fermarble');import thermal
 print(','.join(c['key'] for c in json.load(open('$TEST'))['clips'] if c['camera_mode'] in thermal.THERMAL_MODES))")
-CROPPED=$(python3 -c "import json;c=json.load(open('$C'))
+CROPPED=$($PY -c "import json;c=json.load(open('$C'))
 print(','.join(x['key'] for x in json.load(open('$TEST'))['clips'] if x['key'] in c))")
 log "thermal clips: $THERMAL; cropped clips: $CROPPED"
 gpu "DPVO seed 0" $R/dpvo-seed0 $PY fermarble/run_dpvo.py --dataset $TEST --split test --seed 0
