@@ -9,5 +9,35 @@ references/
 timing/
 release_manifest.json
 
+# local coding-agent instructions, handoffs, and settings
+AGENTS*.md
+CLAUDE*.md
+CODEX*.md
+HANDOFF*.md
+.agents/
+.claude/
+.codex/
+
+# local manual-transfer notes
+/PORTABILITY.md
+
+# local datasets and their download archives (keep fermarble/release/ tracked)
+/release/
+/lookout-vo-test-v*/
+/lookout-vo-dev-v*.tar*
+
+# local preservation payload: model sources, weights, caches, and environment archives
+/portable/
+
+# generated test/build files
+.pytest_cache/
+/factsheet/main.aux
+/factsheet/main.bbl
+/factsheet/main.blg
+/factsheet/main.log
+/factsheet/main.out
+/factsheet/main.fdb_latexmk
+/factsheet/main.fls
+
 # organizers' factsheet template (kept locally, not in the repo)
 factsheet/template/
